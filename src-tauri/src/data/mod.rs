@@ -1,0 +1,12 @@
+pub mod accounts;
+pub mod avatars;
+pub mod crypto;
+pub mod game_lists;
+pub mod launch_presets;
+pub mod recordings;
+pub mod scripts;
+pub mod tinytask;
+pub mod session_history;
+pub mod settings;
+pub mod vault_key;
+pub mod versions;

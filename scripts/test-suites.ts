@@ -1,0 +1,729 @@
+/**
+ * Suítes de teste por funcionalidade.
+ *
+ * Ao mexer numa funcionalidade, rode só a suíte dela (`bun run t <suite>`) —
+ * segundos em vez de minutos. A suíte completa (`bun run check`) continua
+ * obrigatória antes do commit, porque só ela pega quebra cruzada.
+ *
+ * - `rust`: filtros passados ao `cargo test` (casam com o caminho do teste,
+ *   ou seja, o nome do `mod <nome>_tests` e o nome de cada teste).
+ * - `front`: caminhos/globs passados ao `vitest run`.
+ *
+ * Ao criar um `mod ..._tests` novo ou um `*.test.ts(x)` novo, encaixe-o numa
+ * suíte aqui — `bun run t --audit` falha se algo ficar de fora.
+ */
+export interface TestSuite {
+  /** Uma linha explicando o que a suíte cobre. */
+  description: string;
+  rust: string[];
+  front: string[];
+  /** Alvos de `src-tauri/tests/*.rs` (rodados com `cargo test --test <nome>`). */
+  rustIntegration?: string[];
+}
+
+export const SUITES: Record<string, TestSuite> = {
+  launch: {
+    description: "Launch de uma conta, canal/build do Roblox, URL de launch, old join",
+    rust: [
+      "launch_url_tests",
+      "launch_command_tests",
+      "http_timeout_tests",
+      "launch_queue_tests",
+      // Fila que espera o cliente entrar no jogo (launch.rs, General.WaitForGameJoin).
+      "launch_join_wait_tests",
+      "singleton_event_tests",
+      "multi_roblox_decision_tests",
+      "singleton_reservation_tests",
+      "exit_cleanup_tests",
+      "launch_resolve_tests",
+      "launch_shared_helper_tests",
+      "dead_session_tests",
+      "launch_anyway_tests",
+      "channel_follow_tests",
+      "channel_build_pairing_tests",
+      "channel_repair_tests",
+      "production_build_fallback_tests",
+      "build_download_retry_tests",
+      "client_dir_tests",
+      "browser_tracker_tests",
+      "client_settings_file_path_tests",
+      "roblox_install_candidates_tests",
+      "win_process_tests",
+      "win_tracker_tests",
+      "external_client_log_tests",
+      "external_client_match_tests",
+      "external_client_scan_tests",
+      "external_client_command_tests",
+      "win_client_settings_tests",
+      "client_window_plan_tests",
+      "client_window_order_tests",
+      "win_client_window_tests",
+    ],
+    front: [
+      "src/store.test.ts",
+      "src/components/ChooseGameScreen.test.tsx",
+      "src/components/MultiRobloxConfirm.test.tsx",
+      "src/components/OutdatedVersionConfirm.test.tsx",
+      "src/components/session",
+      "src/components/pages/SessionPage.test.tsx",
+      "src/accountLaunchOverrides.test.ts",
+      "src/components/accounts/AccountLaunchOverrides.test.tsx",
+    ],
+  },
+  presets: {
+    description: "Presets de launch (contas → jogo/servidor), agendamento de abrir/fechar e quais clientes cada execução abriu",
+    rust: [
+      "launch_preset_store_tests",
+      "launch_preset_validation_tests",
+      "launch_preset_schedule_tests",
+      "launch_preset_run_tests",
+      "tray_menu_tests",
+    ],
+    front: ["src/components/presets", "src/utils/presets.test.ts"],
+  },
+  history: {
+    description: "Histórico de sessões por conta: observador do monitor de quedas, arquivo JSONL com retenção, sessões, tempo de jogo de 14 dias e CSV",
+    rust: ["session_history_store_tests", "session_history_build_tests", "session_history_observer_tests"],
+    front: [
+      "src/components/accounts/AccountHistory.test.tsx",
+      "src/utils/sessionHistory.test.ts",
+      "src/components/session/SessionPanel.test.tsx",
+      // "Em jogo" agrupado por jogo e servidor.
+      "src/utils/sessionGroups.test.ts",
+      // Região e tempo no ar do servidor (log do cliente).
+      "src/utils/serverUptime.test.ts",
+      // Estado ao vivo na lista de contas e o chip "precisam de atenção".
+      "src/utils/accountLiveState.test.ts",
+      "src/components/accounts/AccountLiveState.test.tsx",
+      // Cliente que fechou no meio do jogo: motivo e "Entrar novamente".
+      "src/utils/closedClients.test.ts",
+      "src/components/layout/Toolbar.test.tsx",
+    ],
+  },
+  "join-links": {
+    description: "Links de convite, VIP/privado, deep links e share links",
+    rust: [
+      "join_link_tests",
+      "join_link_helper_tests",
+      "join_link_http_tests",
+      "join_link_resolve_tests",
+      "share_link_csrf_tests",
+      "private_link_parsing_tests",
+      "private_link_http_tests",
+      "private_link_extra_http_tests",
+    ],
+    front: ["src/components/ChooseGameScreen.test.tsx"],
+  },
+  accounts: {
+    description: "Store de contas, criptografia, modelo e comandos de conta",
+    rust: [
+      "account_store_tests",
+      // Export protegido por senha (ideia 38, Settings › Backups).
+      "account_export_tests",
+      "account_export_command_tests",
+      // Desfazer a remoção de contas (toast "Undo").
+      "account_undo_remove_tests",
+      "account_remove_command_tests",
+      // Renomear grupo (menu de contexto e cabeçalho do grupo).
+      "group_rename_tests",
+      "group_order_rename_tests",
+      "account_helpers_tests",
+      "account_path_tests",
+      "account_api_tests",
+      // Actions › Follow a user (commands/follow_user.rs, api/roblox/follow.rs).
+      "follow_user_tests",
+      "follow_user_batch_tests",
+      "follow_browser_tests",
+      "follow_http_tests",
+      "follow_parse_tests",
+      "read_only_retry_tests",
+      "account_api_http_tests",
+      "cookie_rotation_command_tests",
+      "account_token_swap_tests",
+      "clipboard_command_tests",
+      "win_clipboard_tests",
+      "clipboard_write_only_tests",
+      "moderation_http_tests",
+      "moderation_command_tests",
+      "session_check_http_tests",
+      "account_check_tests",
+      // Acordos atualizados (Termos / Privacidade): conferir e aceitar.
+      "agreements_http_tests",
+      "terms_command_tests",
+      "remember_unlock_tests",
+      "crypto_tests",
+      "vault_key_tests",
+      "vault_migration_tests",
+      "vault_key_warning_event_tests",
+      "model_tests",
+      "data::accounts::tests",
+    ],
+    front: [
+      "src/components/accounts",
+      "src/components/dialogs/AddAccountDialog.test.tsx",
+      "src/components/dialogs/AccountUtilsDialog.test.tsx",
+      // Trocar senha/e-mail em massa (menu Acoes, issue 30).
+      "src/components/dialogs/BulkCredentialsDialog.test.tsx",
+      "src/utils/bulkCredentials.test.ts",
+      "src/utils/credentialErrors.test.ts",
+      "src/components/dialogs/ImportDialog.test.tsx",
+      // Fields da conta: grava ao sair do campo e ao fechar, não só com Enter.
+      "src/components/dialogs/AccountFieldsDialog.test.tsx",
+      "src/components/layout/VaultKeyBanner.test.tsx",
+      // Cópia de credencial pelo backend (ideia 26).
+      "src/components/menus/ContextMenu.test.tsx",
+      "src/components/layout/BottomActionBar.test.tsx",
+      // Moderação (ideia 8): selos e legenda.
+      "src/utils/moderation.test.ts",
+      "src/utils/accountCheck.test.ts",
+      // Janela de resultados do Check Accounts em lote: quais contas, filtro, selecionar banidas.
+      "src/components/dialogs/AccountCheckResultsDialog.test.tsx",
+      // Termos pendentes: texto do estado, resposta exata do Roblox, janela do lote.
+      "src/utils/terms.test.ts",
+      "src/components/dialogs/TermsCheckDialog.test.tsx",
+      // Resultado conta a conta das outras ações do menu Ações, e o "Fazer login de novo".
+      "src/components/dialogs/ActionResultsDialog.test.tsx",
+      "src/components/layout/StatusBar.test.tsx",
+    ],
+  },
+  botting: {
+    description: "Modo botting, watcher de processos, quedas lidas do log do cliente e reconexão automática",
+    rust: [
+      "botting_command_tests",
+      "botting_console_tests",
+      "auto_rejoin_naming_tests",
+      "watcher_tests",
+      "watcher_console_tests",
+      // Língua do Console: toda linha do backend é uma frase em inglês com
+      // chave + parâmetros, traduzida nos quatro idiomas (log_msg.rs).
+      "log_msg_tests",
+      "console_language_tests",
+      "afk_send_error_log_tests",
+      "multi_roblox_notice_log_tests",
+      // Quedas lidas do log do cliente (commands/client_health.rs).
+      "client_log_classifier_tests",
+      "client_log_session_tests",
+      "client_health_monitor_tests",
+      "client_window_title_tests",
+      // Cliente que entrou como outra conta (userid do log ≠ conta lançada).
+      "client_wrong_account_tests",
+      // Região e tempo no ar do servidor de cada cliente (Sessão).
+      "client_server_region_tests",
+      // Linhas do log compartilhadas com os clientes do site (roblox_log.rs).
+      "roblox_log_line_tests",
+      // Reconexão automática da conta que caiu (commands/reconnect.rs).
+      "auto_reconnect_tests",
+      "auto_reconnect_target_tests",
+      // Cliente que fechou no meio do jogo e o "Entrar novamente" (commands/closed_clients.rs).
+      "closed_clients_tests",
+      // Teto de memória que libera RAM antes de fechar (memory_ceiling.rs, memory_trim.rs).
+      "memory_ceiling_tests",
+      "win_memory_trim_tests",
+      // A leitura de memória (memória privada, a do Gerenciador de Tarefas).
+      "win_process_memory_tests",
+    ],
+    // A aba Auto Rejoin do Modo AFK e a moldura (abas, modal) que a abre.
+    front: [
+      "src/components/afk-mode/RejoinTab.test.tsx",
+      "src/components/afk-mode/AfkModeView.test.tsx",
+      "src/utils/clientHealth.test.ts",
+      "src/components/session/SessionPanel.test.tsx",
+      // A página Console mostra o log do Auto Rejoin e do Watcher.
+      "src/components/pages/ConsolePage.test.tsx",
+      // O Console traduz `key` + `params` na hora de desenhar (utils/launchLog.ts).
+      "src/components/console/LaunchConsole.test.tsx",
+      "src/utils/autoReconnect.test.ts",
+      "src/utils/memoryLimit.test.ts",
+      // "While you were away" (Session e Modo AFK): quedas e reconexões anotadas.
+      "src/utils/awayDigest.test.ts",
+      "src/components/session/AwayDigest.test.tsx",
+    ],
+  },
+  afk: {
+    description: "AFK mode: teclas permitidas, modo clique, agendamento por conta e parada do ciclo",
+    rust: [
+      "afk_command_tests",
+      "afk_warning_tests",
+      "afk_input_safety_tests",
+      "hidden_focus_tests",
+      "win_input_tests",
+      "win_focus_tests",
+      // Parada de emergência por chacoalhar o mouse (shake_stop.rs, Afk.ShakeToStop).
+      "shake_stop_tests",
+      // PC acordado durante Modo AFK / Auto Rejoin / reconexão (keep_awake.rs, power.rs).
+      "keep_awake_tests",
+      "win_power_tests",
+    ],
+    // `store.test.ts` entra pelo bloco "AFK mode" (os toasts do start).
+    front: [
+      "src/components/afk-mode/ClicksTab.test.tsx",
+      "src/components/afk-mode/AfkModeView.test.tsx",
+      // O alerta da parada de emergência (chacoalhar o mouse).
+      "src/components/afk-mode/EmergencyStopAlert.test.tsx",
+      "src/utils/afkBeep.test.ts",
+      "src/store.test.ts",
+      "src/afkClickPoint.test.ts",
+      // "While you were away": falhas de envio e parada de emergência anotadas.
+      "src/utils/awayDigest.test.ts",
+      "src/components/session/AwayDigest.test.tsx",
+    ],
+  },
+  recordings: {
+    description: "Gravações: biblioteca, passos, qual vale para cada conta, reprodução e os gatilhos depois da reconexão e depois do launch",
+    rust: [
+      "recordings_store_tests",
+      "recordings_validation_tests",
+      "recordings_playback_tests",
+      "recordings_after_reconnect_tests",
+      "recordings_after_launch_tests",
+      "recordings_afk_mode_tests",
+      // Importar do TinyTask (.rec): leitura do arquivo e conversão em passos.
+      "tinytask_import_tests",
+      // As portas novas do módulo de entrada (press_recording_key, click_recording_point).
+      "win_input_tests",
+      // A reprodução mora na árvore do Modo AFK: a trava continua valendo.
+      "afk_input_safety_tests",
+      // Chacoalhar o mouse também para a gravação tocando (shake_stop.rs).
+      "shake_stop_tests",
+    ],
+    front: [
+      "src/components/afk-mode/RecordingsTab.test.tsx",
+      "src/recordings.test.ts",
+      "src/components/afk-mode/recordings/triggers.test.ts",
+      "src/components/afk-mode/AfkModeView.test.tsx",
+    ],
+  },
+  isolation: {
+    description: "Isolamento pré-launch (cache, registro, MachineGuid/MAC)",
+    rust: ["win_isolation_tests", "isolation_command_tests"],
+    front: ["src/components/settings", "src/components/IsolationProgressOverlay.test.tsx"],
+  },
+  versions: {
+    description: "Catálogo e instalação de versões do Roblox",
+    rust: [
+      "win_versions_tests",
+      "outdated_version_choice_tests",
+      "old_join_current_build_tests",
+      "build_download_retry_tests",
+      "versions_catalog_tests",
+      "versions_command_tests",
+      "versions_atomic_tests",
+      "updater_tests",
+    ],
+    front: [
+      "src/components/dialogs/VersionsDialog.test.tsx",
+      "src/updaterChannels.test.ts",
+      "src/components/dialogs/UpdateDialog.test.tsx",
+      "src/releaseNotes.test.ts",
+      "src/components/pages/ChangelogPage.test.tsx",
+      "src/updateHandoff.test.ts",
+      "src/hooks/useUpdateHandoffToast.test.ts",
+    ],
+  },
+  api: {
+    description: "Cliente da API do Roblox (auth, users, thumbnails, economy, presence, batch)",
+    rust: [
+      "auth_http_tests",
+      "auth_extra_tests",
+      "auth_challenge_tests",
+      // Motivo de recusa na troca de senha/e-mail (lote do menu Acoes).
+      "credential_failure_tests",
+      "cookie_rotation_tests",
+      "csrf_retry_tests",
+      "user_api_tests",
+      "user_http_tests",
+      "avatar_games_http_tests",
+      "avatar_games_extra_tests",
+      "thumbnail_http_tests",
+      "thumbnail_batch_tests",
+      "economy_http_tests",
+      "economy_extra_tests",
+      "social_presence_http_tests",
+      "social_presence_extra_tests",
+      "http_retry_tests",
+      "http_client_tests",
+      "http_timeout_tests",
+      "endpoint_host_tests",
+      "image_cache_tests",
+      "image_cache_command_tests",
+    ],
+    front: [],
+  },
+  avatars: {
+    description: "Avatares gratuitos: catálogo oficial gratuito, resgate de itens, distribuição entre contas (só na edição completa)",
+    rust: [
+      "avatar_catalog_tests",
+      "avatar_claim_tests",
+      "avatar_store_tests",
+      "avatar_batch_tests",
+      // Só roda com `cargo test --no-default-features` (edição padrão).
+      "avatar_batch_disabled_tests",
+      "avatar_cache_invalidation_tests",
+    ],
+    front: [
+      "src/avatarBuilder.test.ts",
+      "src/components/pages/AvatarsPage.test.tsx",
+      "src/components/pages/AvatarsPage.edition.test.tsx",
+      "src/components/pages/avatars",
+      // `store.test.ts` entra pelo bloco `refreshAvatarHeadshots` (foto da conta depois do lote).
+      "src/store.test.ts",
+    ],
+  },
+  groups: {
+    description: "Página Groups: busca sozinha, grupos populares, entrada em lote uma conta por vez, desafio (captcha ou confirmação) resolvido no navegador da conta, Try again",
+    rust: [
+      "group_reference_tests",
+      "group_join_http_tests",
+      "group_membership_http_tests",
+      "group_join_batch_tests",
+      // Entrada pelo navegador da conta (13/10/2026), com página de mentira.
+      "group_browser_join_tests",
+      "group_read_for_join_tests",
+      "social_presence_extra_tests",
+      "chromium_commands_tests",
+    ],
+    front: [
+      "src/components/pages/GroupsPage.test.tsx",
+      "src/components/layout/NavSidebar.test.tsx",
+      // Pedido de estrela no GitHub (rodapé da barra lateral).
+      "src/utils/starPrompt.test.ts",
+    ],
+  },
+  webserver: {
+    description: "Servidor HTTP local: rotas, senha e bloqueio anti-CSRF",
+    rust: [
+      "edit_permission_tests",
+      "handlers_basic_tests",
+      "handlers_launch_tests",
+      "middleware_tests",
+      "password_tests",
+      "server_helpers_tests",
+      "server_query_tests",
+      "server_state_tests",
+      "route_wrapper_tests",
+      "services_command_tests",
+    ],
+    front: ["src/components/settings/settingsTabs.test.tsx"],
+  },
+  nexus: {
+    description: "Servidor WebSocket do Nexus",
+    rust: ["nexus_query_tests"],
+    front: ["src/components/pages/NexusPage.test.tsx"],
+  },
+  scripts: {
+    description: "Scripts do usuário: store, sandbox e redação de segredos",
+    rust: ["scripts_store_tests"],
+    rustIntegration: ["security_regression_scripts_store"],
+    front: [
+      "src/scripting",
+      "src/components/pages/scriptsRedact.test.ts",
+      "src/components/pages/scriptsInvokeSecurity.test.tsx",
+      "src/components/pages/ScriptsPage.test.tsx",
+    ],
+  },
+  backups: {
+    description: "Backup e restauração dos dados, onde a pasta de dados fica e os favoritos/recentes (RAMGameLists.json)",
+    rust: ["backups_tests", "settings_paths_tests", "game_lists_store_tests"],
+    front: ["src/components/settings/BackupsTab.test.tsx", "src/components/server-list/gameListsSync.test.ts"],
+  },
+  friends: {
+    description: "Amigos online por conta e entrada no servidor do amigo",
+    rust: [
+      "friends_online_tests",
+      "friends_online_http_tests",
+      "presence_cookie_tests",
+      "online_friends_batch_tests",
+      // Recentes por conta (o "Continuar" do Roblox), na aba Recentes.
+      "recent_games_parse_tests",
+      "recent_games_http_tests",
+      "recent_games_command_tests",
+    ],
+    front: [
+      "src/components/friends",
+      "src/components/server-list/AccountRecentGames.test.tsx",
+      // "Wait until they're in a game" da aba Seguir: política e laço.
+      "src/utils/waitForPlayer.test.ts",
+      "src/components/follow",
+    ],
+  },
+  servers: {
+    description: "Escolha de servidor (aleatório/vazio/cheio), região e navegador de servidores",
+    rust: [
+      "server_preference_tests",
+      "server_pick_http_tests",
+      "server_region_format_tests",
+      "server_region_payload_tests",
+      "server_region_http_tests",
+      "client_server_region_tests",
+      "roblox_log_line_tests",
+      "server_scan_budget_tests",
+      "server_scan_dedupe_tests",
+      // Seção "Private servers" da aba Servers (private-servers da conta).
+      "private_servers_list_tests",
+      "private_servers_command_tests",
+    ],
+    front: ["src/components/servers", "src/components/server-list"],
+  },
+  live: {
+    description: "Live: a janela MultiAlt Live com as contas numa grade para transmitir (miniaturas do DWM, seleção, grade)",
+    rust: ["live_view_tests", "live_view_command_tests"],
+    front: ["src/live/liveGrid.test.ts", "src/components/pages/LivePage.test.tsx"],
+  },
+  webhook: {
+    description: "Página Discord alerts: URL, eventos, menção por evento, horário silencioso, lote/limite, status ao vivo, resumo do dia, envio mockado",
+    rust: [
+      "discord_webhook_url_tests",
+      "discord_webhook_message_tests",
+      "discord_webhook_queue_tests",
+      "discord_webhook_http_tests",
+      "discord_status_tests",
+      "discord_status_http_tests",
+      "webhook_glue_tests",
+    ],
+    front: ["src/components/discord/DiscordSettings.test.tsx", "src/utils/discordWebhook.test.ts"],
+  },
+  settings: {
+    description: "RAMSettings.ini, defaults, temas e presets",
+    rust: [
+      "ini_tests",
+      "ini_structure_tests",
+      "settings_store_tests",
+      "settings_paths_tests",
+      "theme_store_tests",
+      "theme_preset_tests",
+      "theme_font_command_tests",
+      "theme_preset_bytes_command_tests",
+    ],
+    front: [
+      "src/components/settings",
+      "src/components/pages/ThemePage.test.tsx",
+      "src/theme.test.ts",
+      // Texto apagado a 4,5:1 em todo tema (página Session, 11/10/2026).
+      "src/themeContrast.test.ts",
+      "src/themeFonts.test.ts",
+      "src/fontPresets.test.ts",
+      "src/hooks/useSettings.test.ts",
+    ],
+  },
+  chromium: {
+    description: "Chromium via CDP: download, argumentos, sessão de login",
+    rust: [
+      "chromium_cdp_tests",
+      "browser_diagnose_tests",
+      "chromium_manager_tests",
+      "chromium_commands_tests",
+      "chromium_download_tests",
+    ],
+    front: ["src/utils/chromiumErrors.test.ts"],
+  },
+  signup: {
+    description: "Criação de contas no formulário do Roblox (CAPTCHA pelo usuário)",
+    rust: [
+      "signup_identity_tests",
+      "signup_script_tests",
+      "signup_session_tests",
+      "username_check_tests",
+      "username_check_http_tests",
+      "generator_failure_budget_tests",
+    ],
+    front: [
+      "src/components/signup",
+      "src/components/dialogs/GeneratorDialog.test.tsx",
+      "src/components/dialogs/accountGeneratorHidden.test.tsx",
+    ],
+  },
+  ui: {
+    description: "Casca da UI: layout, menus, componentes genéricos, i18n, hooks",
+    rust: ["webview_recovery_tests"],
+    front: [
+      "src/components/layout",
+      "src/components/menus",
+      "src/components/ui",
+      "src/components/server-list",
+      "src/App.test.tsx",
+      "src/hooks",
+      // Seleção em lista (Shift, Ctrl, arrastar) das listas de contas fora da principal.
+      "src/utils/listSelection.test.ts",
+      "src/i18n",
+      "src/types.test.ts",
+      "src/tauriWindowConfig.test.ts",
+      "src/uiScale.test.ts",
+      "src/components/settings/AppTab.test.tsx",
+      // Janela grande: páginas sem teto de largura em lista/cartão.
+      "src/components/pages/wideLayout.test.ts",
+      "src/repoOwnership.test.ts",
+      "src/utils",
+      "src/featureFlags.test.ts",
+      "src/components/dialogs/FeedbackDialog.test.tsx",
+      "src/utils/inactivityLock.test.ts",
+      "src/hooks/useInactivityLock.test.ts",
+      "src/components/layout/LockOverlay.test.tsx",
+      "src/components/settings/inactivityLockSetting.test.tsx",
+      "src/components/dialogs/QuickLoginDialog.test.tsx",
+      "src/components/dialogs/AddAccountDialog.test.tsx",
+      "src/components/layout/Toolbar.test.tsx",
+    ],
+  },
+  "hidden-names": {
+    description: "Names hidden: nome e foto das contas mascarados em toda tela (utils/accountName.ts)",
+    rust: [],
+    front: [
+      "src/utils/accountName.test.ts",
+      "src/hooks/useAccountLabel.test.ts",
+      "src/components/dialogs/hiddenNamesDialogs.test.tsx",
+      "src/components/afk-mode/RejoinTab.test.tsx",
+      "src/components/afk-mode/ClicksTab.test.tsx",
+      "src/components/pages/AvatarsPage.test.tsx",
+      "src/components/pages/GroupsPage.test.tsx",
+      "src/components/pages/NexusPage.test.tsx",
+      "src/components/menus/ContextMenu.test.tsx",
+      "src/components/dialogs/AccountUtilsDialog.test.tsx",
+      "src/components/dialogs/ImportDialog.test.tsx",
+      "src/components/dialogs/GeneratorDialog.test.tsx",
+      "src/components/server-list/ServerListDialog.test.tsx",
+      "src/hooks/useJoinOnlineWarning.test.ts",
+      "src/components/ChooseGameScreen.test.tsx",
+      "src/components/friends/FriendsTab.test.tsx",
+      "src/components/session/SessionPanel.test.tsx",
+      "src/components/accounts",
+      "src/components/layout/BottomActionBar.test.tsx",
+      "src/types.test.ts",
+    ],
+  },
+  navigation: {
+    description: "Barra lateral e páginas (Session, AFK Mode, Avatars, Groups, Scripts, Theme, Nexus, Settings, What's new) no lugar dos modais; Voltar/Avançar do mouse e Alt+setas",
+    rust: [],
+    front: [
+      "src/components/layout/NavSidebar.test.tsx",
+      "src/components/layout/Toolbar.test.tsx",
+      "src/components/layout/FirstRunWalkthrough.test.tsx",
+      "src/components/pages",
+      "src/components/settings/settingsTabs.test.tsx",
+      "src/App.test.tsx",
+      "src/store.test.ts",
+      "src/utils/pageHistory.test.ts",
+      "src/hooks/useMouseNavigation.test.ts",
+      "src/hooks/useEscapeStack.test.ts",
+    ],
+  },
+  tutorials: {
+    description: "Tutoriais de tela (botão Tutorial): motor, \"já visto\" e o passeio de cada tela com as âncoras na tela",
+    rust: [],
+    front: [
+      "src/components/tour",
+      "src/components/layout/FirstRunWalkthrough.test.tsx",
+      "src/App.test.tsx",
+      "src/components/ChooseGameScreen.test.tsx",
+      "src/components/afk-mode/AfkModeView.test.tsx",
+      "src/components/pages",
+      "src/components/settings/settingsTabs.test.tsx",
+      "src/i18n/locales.test.ts",
+    ],
+  },
+  diagnostics: {
+    description: "Diagnóstico de mutex, janelas, otimização de processo e capacidades da plataforma",
+    rust: [
+      "diagnostics_tests",
+      "win_windowing_tests",
+      "win_grid_slot_tests",
+      "win_grid_auto_fit_tests",
+      "grid_overflow_real_tests",
+      "win_optimization_tests",
+      "generator_command_tests",
+      "generator_http_tests",
+      "platform_info_tests",
+    ],
+    // Grade de janelas (cartão Window grid da página Console).
+    front: ["src/utils/platform.test.ts", "src/components/console/WindowGridCard.test.tsx"],
+  },
+  support: {
+    description: "Pacote Suporte: checagem \"o launch não faz nada\" (16), reportar problema com resumo anonimizado (28), trancar por inatividade (27), Quick Login (12) e reserva do singleton do Roblox (3)",
+    rust: [
+      "launch_diagnostics_tests",
+      "os_version_label_tests",
+      "services_command_tests",
+      "console_window_tests",
+      "app_lock_command_tests",
+      "app_lock_verify_tests",
+      "quick_login_add_tests",
+      "quick_login_command_tests",
+      "singleton_reservation_tests",
+      "multi_roblox_decision_tests",
+    ],
+    front: [
+      "src/utils/diagnostics.test.ts",
+      "src/components/dialogs/DiagnosticsDialog.test.tsx",
+      "src/App.test.tsx",
+      "src/utils/anonymize.test.ts",
+      "src/utils/problemReport.test.ts",
+      "src/components/dialogs/FeedbackDialog.test.tsx",
+      "src/utils/inactivityLock.test.ts",
+      "src/hooks/useInactivityLock.test.ts",
+      "src/components/layout/LockOverlay.test.tsx",
+      "src/components/settings/inactivityLockSetting.test.tsx",
+      "src/components/dialogs/QuickLoginDialog.test.tsx",
+      "src/components/dialogs/AddAccountDialog.test.tsx",
+      "src/components/layout/Toolbar.test.tsx",
+    ],
+  },
+  performance: {
+    description: "Desempenho enquanto joga: otimização que segue a janela em uso, fundo mudo (live-audio), grade menor e sem moldura, FastFlags (lista do Roblox e perfis prontos)",
+    rust: [
+      "focus_follow_tests",
+      "win_optimization_tests",
+      "live_audio_tests",
+      "live_audio_com_tests",
+      "platform_info_tests",
+      "win_grid_style_tests",
+      "win_grid_slot_tests",
+      "win_grid_auto_fit_tests",
+      "client_window_plan_tests",
+      // Devolver as configurações do Roblox ao fechar (ideia 21, settings_restore.rs).
+      "win_settings_restore_tests",
+      "settings_on_exit_tests",
+      "settings_record_tests",
+    ],
+    front: [
+      "src/components/settings/settingsTabs.test.tsx",
+      "src/components/console/WindowGridCard.test.tsx",
+      // FastFlags: a lista oficial do Roblox e os perfis prontos com "+".
+      "src/utils/fastFlagPresets.test.ts",
+    ],
+  },
+  release: {
+    description: "Workflow de release: número da próxima versão (série pelo major do package.json), tipo da release (fix/feature/mixed) e o bump que ele decide, manifesto só com o MSI e interruptor do portátil",
+    rust: [],
+    front: [
+      ".github/scripts/release-version.test.mjs",
+      ".github/scripts/release-kind.test.mjs",
+      ".github/scripts/update-manifest-platforms.test.mjs",
+      ".github/scripts/release-workflow.test.mjs",
+      ".github/scripts/ci-workflow.test.mjs",
+      "src/appIdentity.test.ts",
+    ],
+  },
+  python: {
+    description: "Automação do Roblox Player em Python: runtime, workspace, protocolo, primitivas, execuções, pipe, SDK e tela",
+    // O filtro `python_` casa com todo `mod python_*_tests` (src-tauri/src/python/
+    // e platform/windows/capture.rs).
+    rust: ["python_"],
+    front: ["src/components/python"],
+  },
+  scan: {
+    description: "bun run scan: veredito do Defender e do VirusTotal por arquivo, com o portão de cada edição (padrão: nada; completa: só o Trapmine de ML)",
+    rust: [],
+    front: ["scripts/scanVerdict.test.ts"],
+  },
+  "build-test": {
+    description: "bun run build:test: executáveis de teste rápidos (perfil test-exe, sem LTO) de cada edição, com o nome da pasta de testes",
+    rust: [],
+    front: ["scripts/buildTestPlan.test.ts"],
+  },
+  site: {
+    description: "Site de divulgação: páginas /pt/ e /es/ geradas, hreflang, FAQ estruturado, sitemap",
+    rust: [],
+    front: ["scripts/site"],
+  },
+};
+
+export const SUITE_NAMES = Object.keys(SUITES).sort();

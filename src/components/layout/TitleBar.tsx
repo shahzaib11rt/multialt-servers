@@ -1,0 +1,128 @@
+import { useState, useEffect, useCallback } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
+import { TEST_BUILD_LABEL, titleVersion } from "../../buildInfo";
+import { Minus, Square, Copy, X, Github } from "lucide-react";
+import { Tooltip } from "../ui/Tooltip";
+import { useTr } from "../../i18n/text";
+import { REPO_URL } from "../../repo";
+
+export function TitleBar({ controlsHidden = false }: { controlsHidden?: boolean }) {
+  const t = useTr();
+  const repoUrl = REPO_URL;
+  const [maximized, setMaximized] = useState(false);
+  const [minimizeToTray, setMinimizeToTray] = useState(false);
+  const [version, setVersion] = useState<string | null>(null);
+  const appWindow = getCurrentWindow();
+
+  // A versão sempre à vista no título (pedido do dono, 24/10/2026): quem manda
+  // print num ticket já mostra qual build está usando.
+  useEffect(() => {
+    getVersion().then(setVersion).catch(() => {});
+  }, []);
+  const versionText = titleVersion(version, TEST_BUILD_LABEL);
+
+  useEffect(() => {
+    appWindow.isMaximized().then(setMaximized);
+    const unlisten = appWindow.onResized(() => {
+      appWindow.isMaximized().then(setMaximized);
+    });
+    invoke<string>("get_setting", { section: "General", key: "MinimizeToTray" })
+      .then((v) => setMinimizeToTray(v === "true"))
+      .catch(() => {});
+    return () => { unlisten.then((fn) => fn()); };
+  }, []);
+
+  const handleClose = useCallback(() => {
+    if (minimizeToTray) {
+      appWindow.hide();
+    } else {
+      appWindow.close();
+    }
+  }, [minimizeToTray]);
+
+  return (
+    <div className="theme-titlebar theme-border flex items-center h-9 shrink-0 select-none border-b">
+      <div className="flex items-center gap-2.5 pl-3.5 pr-3 shrink-0">
+        <span className="text-[12px] font-medium tracking-tight">
+          {t("MultiAlt")}
+        </span>
+        {/* O nome antigo como subtítulo: até a v0.1.8 o app era o "Roblox Account
+            Manager" (docs/rebrand-multialt.md), e é por ele que muita gente o conhece. */}
+        <span className="text-[11px] theme-muted tracking-tight">
+          {t("Roblox Account Manager")}
+        </span>
+        {versionText && (
+          <span data-testid="titlebar-version" className="text-[11px] theme-muted tabular-nums tracking-tight">
+            {versionText}
+          </span>
+        )}
+      </div>
+
+      <div
+        className="flex-1 h-full"
+        onMouseDown={() => appWindow.startDragging()}
+      />
+
+      <div
+        className={[
+          "flex items-center shrink-0 overflow-hidden transition-all duration-250 ease-out",
+          controlsHidden
+            ? "max-w-0 opacity-0 scale-95 -translate-y-1 pointer-events-none"
+            : "max-w-[176px] opacity-100 scale-100 translate-y-0",
+        ].join(" ")}
+      >
+        {/*
+          A documentação do app (docs/, incluindo o mapa da interface) mora no
+          repositório — então este botão é a porta dela, e o rótulo diz isso.
+          A ajuda dentro do app é o botão de walkthrough na Toolbar.
+        */}
+        <Tooltip content={t("Open the GitHub repository (docs included)")} side="bottom" delayMs={500}>
+          <button
+            aria-label={t("Open the GitHub repository (docs included)")}
+            onClick={() => {
+              void invoke("open_repo_url").catch(() => {
+                window.open(repoUrl, "_blank");
+              });
+            }}
+            className="h-9 w-11 flex items-center justify-center theme-muted hover:text-[var(--panel-fg)] hover:bg-[var(--panel-soft)] transition-colors"
+          >
+            <Github size={12} strokeWidth={1.6} />
+          </button>
+        </Tooltip>
+        <Tooltip content={t("Minimize")} side="bottom" delayMs={500}>
+          <button
+            onClick={() => appWindow.minimize()}
+            aria-label={t("Minimize")}
+            className="h-9 w-11 flex items-center justify-center theme-muted hover:text-[var(--panel-fg)] hover:bg-[var(--panel-soft)] transition-colors"
+          >
+            <Minus size={12} strokeWidth={1} />
+          </button>
+        </Tooltip>
+        <Tooltip content={maximized ? t("Restore") : t("Maximize")} side="bottom" delayMs={500}>
+          <button
+            onClick={() => appWindow.toggleMaximize()}
+            aria-label={maximized ? t("Restore") : t("Maximize")}
+            className="h-9 w-11 flex items-center justify-center theme-muted hover:text-[var(--panel-fg)] hover:bg-[var(--panel-soft)] transition-colors"
+          >
+            {maximized ? (
+              <Copy size={12} strokeWidth={1} />
+            ) : (
+              <Square size={12} strokeWidth={1} />
+            )}
+          </button>
+        </Tooltip>
+        <Tooltip content={minimizeToTray ? t("Minimize to tray") : t("Close")} side="bottom" delayMs={500}>
+          <button
+            onClick={handleClose}
+            aria-label={minimizeToTray ? t("Minimize to tray") : t("Close")}
+            className="h-9 w-11 flex items-center justify-center theme-muted hover:text-white hover:bg-red-600/80 transition-colors rounded-tr-none"
+          >
+            <X size={12} strokeWidth={1.2} />
+          </button>
+        </Tooltip>
+      </div>
+    </div>
+  );
+}

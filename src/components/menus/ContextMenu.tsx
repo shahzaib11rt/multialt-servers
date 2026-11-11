@@ -1,0 +1,531 @@
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { useStore } from "../../store";
+import { usePrompt, useConfirm } from "../../hooks/usePrompt";
+import {
+  useCopyCredentialWarning,
+  type CopyCredentialKind,
+} from "../../hooks/useCopyCredentialWarning";
+import { useEscapeStack } from "../../hooks/useEscapeStack";
+import { copyAccountSecret } from "../../utils/copySecret";
+import { useTr } from "../../i18n/text";
+import { groupLabel, MAX_ALIAS_LENGTH } from "../../types";
+import { accountLabel, maskAccountName } from "../../utils/accountName";
+import { canRenameGroup, useRenameGroup } from "../../hooks/useRenameGroup";
+import { MenuItemView } from "./MenuItemView";
+import type { MenuItem } from "./MenuItemView";
+
+export function ContextMenu() {
+  const store = useStore();
+  const t = useTr();
+  const prompt = usePrompt();
+  const confirm = useConfirm();
+  const confirmCopyCredential = useCopyCredentialWarning();
+  const renameGroup = useRenameGroup();
+  const ref = useRef<HTMLDivElement>(null);
+  const [menuPos, setMenuPos] = useState<{ left: number; top: number } | null>(null);
+
+  // Só quando há menu aberto **e** ele é o topo. Antes o listener nascia no boot
+  // do app e nunca saía, então um Escape sem menu já chamava `closeContextMenu` —
+  // e, com menu aberto, a lista limpava a seleção no mesmo evento.
+  useEscapeStack(!!store.contextMenu, store.closeContextMenu);
+
+  useEffect(() => {
+    function handleClick(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) {
+        store.closeContextMenu();
+      }
+    }
+    document.addEventListener("mousedown", handleClick);
+    return () => {
+      document.removeEventListener("mousedown", handleClick);
+    };
+  }, [store.closeContextMenu]);
+
+  useLayoutEffect(() => {
+    if (!store.contextMenu) return;
+    const el = ref.current;
+    if (!el) return;
+    const pad = 8;
+    const width = el.offsetWidth || 220;
+    const height = el.offsetHeight || 360;
+    const left = Math.max(pad, Math.min(store.contextMenu.x, window.innerWidth - width - pad));
+    const top = Math.max(pad, Math.min(store.contextMenu.y, window.innerHeight - height - pad));
+    setMenuPos({ left, top });
+  }, [store.contextMenu]);
+
+  if (!store.contextMenu) return null;
+
+  const accounts = store.selectedAccounts;
+  const single = accounts.length === 1 ? accounts[0] : null;
+  const userIds = accounts.map((a) => a.UserID);
+  const bottingActive = store.bottingStatus?.active === true;
+  const activeBottingIds = new Set(store.bottingStatus?.userIds || []);
+  const addableBottingIds = userIds.filter((id) => !activeBottingIds.has(id));
+  const launchedSelectedIds = userIds.filter((id) => store.launchedByProgram.has(id));
+  const singleLaunched = !!single && launchedSelectedIds.includes(single.UserID);
+
+  async function copyToClipboard(text: string, label: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+      store.addToast(t("Copied {{label}}", { label }));
+    } catch {
+      store.addToast(t("Failed to copy"));
+    }
+  }
+
+  function normalizeQuickLoginCode(value: string) {
+    return value.replace(/\D/g, "");
+  }
+
+  /**
+   * `credential` liga o aviso: cookie, senha, user:pass e user:pass:cookie saem daqui para a área
+   * de transferência de **todas** as contas selecionadas de uma vez. Username,
+   * User ID e Profile Link não são credencial e continuam sem confirmação.
+   */
+  async function copyMulti(
+    getter: (a: typeof accounts[0]) => string,
+    label: string,
+    credential?: CopyCredentialKind
+  ) {
+    if (!credential) {
+      await copyToClipboard(accounts.map(getter).join("\n"), label);
+      return;
+    }
+    if (!(await confirmCopyCredential(credential, accounts.length))) return;
+    // Credencial vai pelo backend: fora do histórico do Win+V e apagada
+    // sozinha depois de 30 s (ver utils/copySecret.ts).
+    try {
+      const result = await copyAccountSecret(userIds, credential, () =>
+        accounts.map(getter).join("\n")
+      );
+      store.addToast(
+        result.clearsInSecs
+          ? t("Copied {{label}}. Cleared from the clipboard in {{seconds}} s.", {
+              label,
+              seconds: result.clearsInSecs,
+            })
+          : t("Copied {{label}}", { label })
+      );
+    } catch {
+      store.addToast(t("Failed to copy"));
+    }
+  }
+
+  const copySubmenu: MenuItem[] = [
+    {
+      label: t("Cookie"),
+      action: () => copyMulti((a) => a.SecurityToken, t("cookie"), "cookie"),
+    },
+    {
+      label: t("Username"),
+      action: () => copyMulti((a) => a.Username, t("username")),
+    },
+    {
+      label: t("Password"),
+      action: () => copyMulti((a) => a.Password, t("password"), "password"),
+    },
+    {
+      label: t("User:Pass"),
+      action: () =>
+        copyMulti((a) => `${a.Username}:${a.Password}`, t("user:pass"), "userpass"),
+    },
+    {
+      label: t("User:Pass:Cookie"),
+      action: () =>
+        copyMulti(
+          (a) => `${a.Username}:${a.Password}:${a.SecurityToken}`,
+          t("user:pass:cookie"),
+          "userpasscookie"
+        ),
+    },
+    { separator: true, label: "" },
+    {
+      label: t("User ID"),
+      action: () => copyMulti((a) => String(a.UserID), t("user ID")),
+    },
+    {
+      label: t("Profile Link"),
+      action: () =>
+        copyMulti(
+          (a) => `https://www.roblox.com/users/${a.UserID}/profile`,
+          t("profile link")
+        ),
+    },
+  ];
+
+  if (store.devMode) {
+    copySubmenu.push(
+      { separator: true, label: "" },
+      {
+        label: t("rbx-player Link"),
+        devOnly: true,
+        action: async () => {
+          if (!single) return;
+          // O link não é só texto: montá-lo pede um auth ticket novo à Roblox, e
+          // quem abrir o link entra como esta conta.
+          const name = accountLabel(single, store);
+          if (
+            !(await confirm(
+              t(
+                "Copy a roblox-player launch link for {{name}}? The app asks Roblox for a new auth ticket to build it, and whoever opens the link joins as {{name}}.",
+                { name }
+              )
+            ))
+          ) {
+            return;
+          }
+          try {
+            const ticket = await invoke<string>("get_auth_ticket", {
+              userId: single.UserID,
+            });
+            const ts = Date.now();
+            const url = `roblox-player://1/1+launchmode:play+gameinfo:${ticket}+launchtime:${ts}+placelauncherurl:https://assetgame.roblox.com/game/PlaceLauncher.ashx?request=RequestGame%26placeId=${store.placeId}+placeId:${store.placeId}`;
+            await copyToClipboard(url, t("rbx-player link"));
+          } catch (e) {
+            store.addToast(t("Error: {{error}}", { error: String(e) }));
+          }
+        },
+      },
+      {
+        label: t("App Link"),
+        devOnly: true,
+        action: async () => {
+          if (!single) return;
+          const name = accountLabel(single, store);
+          if (
+            !(await confirm(
+              t(
+                "Copy an app launch link for {{name}}? The app asks Roblox for a new auth ticket to build it, and whoever opens the link signs in as {{name}}.",
+                { name }
+              )
+            ))
+          ) {
+            return;
+          }
+          try {
+            const ticket = await invoke<string>("get_auth_ticket", {
+              userId: single.UserID,
+            });
+            const ts = Date.now();
+            const url = `roblox-player://1/1+launchmode:app+gameinfo:${ticket}+launchtime:${ts}+browsertrackerid:${single.BrowserTrackerID || Math.floor(Math.random() * 1e12)}`;
+            await copyToClipboard(url, t("app link"));
+          } catch (e) {
+            store.addToast(t("Error: {{error}}", { error: String(e) }));
+          }
+        },
+      }
+    );
+  }
+
+  const existingGroups = [...new Set(store.accounts.map((a) => a.Group || "Default"))];
+  const moveToGroupSubmenu: MenuItem[] = [
+    ...existingGroups.map((g) => ({
+      label: groupLabel(g, t),
+      action: () => store.moveToGroup(userIds, g, { report: userIds.length > 1 }),
+    })),
+    { separator: true, label: "" },
+    {
+      label: t("New Group..."),
+      action: async () => {
+        const name = await prompt(t("Group name:"));
+        if (name?.trim()) store.moveToGroup(userIds, name.trim(), { report: userIds.length > 1 });
+      },
+    },
+  ];
+
+  const items: MenuItem[] = [
+    {
+      label: t("Set Alias"),
+      action: async () => {
+        // O campo trava no mesmo limite da sidebar: antes aceitava colar 300
+        // caracteres, gravava 240 e avisava só "Alias updated".
+        const alias = await prompt(t("Alias:"), single?.Alias || "", {
+          maxLength: MAX_ALIAS_LENGTH,
+          // Com os nomes ocultos o alias atual não aparece no campo.
+          ...(store.hideUsernames ? { masked: true } : {}),
+        });
+        if (alias === null) return;
+        const cortado = alias.length > MAX_ALIAS_LENGTH;
+        for (const a of accounts) {
+          store.updateAccount({ ...a, Alias: alias.slice(0, MAX_ALIAS_LENGTH) });
+        }
+        // Rede para o que chegar por fora do campo (um alias antigo maior que o
+        // limite vindo como valor inicial): o corte não fica calado.
+        if (cortado) {
+          store.addToast(t("Alias updated — cut to {{max}} characters", { max: MAX_ALIAS_LENGTH }), "warn");
+        } else {
+          store.addToast(t("Alias updated"));
+        }
+      },
+    },
+    {
+      label: t("Set Description"),
+      action: async () => {
+        const desc = await prompt(t("Description:"), single?.Description || "");
+        if (desc === null) return;
+        for (const a of accounts) {
+          store.updateAccount({ ...a, Description: desc });
+        }
+        store.addToast(t("Description updated"));
+      },
+    },
+    { separator: true, label: "" },
+    { label: t("Copy"), submenu: copySubmenu },
+    // Novo login de propósito (não só quando a sessão morreu): o navegador de
+    // login abre com usuário e senha preenchidos quando salvos.
+    {
+      label: t("Sign in again"),
+      action: async () => {
+        const ok = await confirm(
+          t(
+            "{{count}} account(s) need to sign in again. A browser window opens for each one, one at a time, with the username and password filled in when they are saved. You solve the CAPTCHA, and the new session goes into the same account.",
+            { count: userIds.length }
+          )
+        );
+        if (ok) await store.reloginAccounts(userIds);
+      },
+    },
+    { separator: true, label: "" },
+  ];
+
+  if (bottingActive) {
+    items.push({
+      label:
+        addableBottingIds.length > 1
+          ? t("Add {{count}} accounts to Auto Rejoin", { count: addableBottingIds.length })
+          : addableBottingIds.length === 1
+            ? t("Add {{count}} account to Auto Rejoin", { count: 1 })
+            : t("Already in Auto Rejoin"),
+      action: async () => {
+        if (addableBottingIds.length === 0) {
+          store.addToast(t("Selected accounts are already in Auto Rejoin"));
+          return;
+        }
+        try {
+          await store.addBottingAccounts(addableBottingIds, { report: addableBottingIds.length > 1 });
+        } catch (e) {
+          store.addToast(t("Auto Rejoin account action failed: {{error}}", { error: String(e) }));
+        }
+      },
+    });
+    items.push({ separator: true, label: "" });
+  }
+
+  if (singleLaunched || launchedSelectedIds.length > 0) {
+    if (singleLaunched) {
+      items.push({
+        label: t("Focus client"),
+        action: async () => {
+          if (!single) return;
+          try {
+            const focused = await store.focusRobloxClient(single.UserID);
+            if (!focused) {
+              store.addToast(t("No active Roblox window found for this account"));
+            }
+          } catch (e) {
+            store.addToast(t("Failed to focus client: {{error}}", { error: String(e) }));
+          }
+        },
+      });
+    }
+
+    items.push({
+      label:
+        launchedSelectedIds.length <= 1
+          ? t("Restart client")
+          : t("Restart clients ({{count}})", { count: launchedSelectedIds.length }),
+      action: async () => {
+        await store.restartRobloxClients(launchedSelectedIds, { report: launchedSelectedIds.length > 1 });
+      },
+    });
+
+    items.push({ separator: true, label: "" });
+  }
+
+  if (store.devMode) {
+    items.push(
+      {
+        label: t("Get Auth Ticket"),
+        devOnly: true,
+        action: async () => {
+          if (!single) return;
+          // O ticket cru vale o mesmo que os dois links: quem o tiver entra como
+          // esta conta enquanto ele durar.
+          const name = accountLabel(single, store);
+          if (
+            !(await confirm(
+              t(
+                "Copy the raw auth ticket of {{name}}? The app asks Roblox for a new one, and whoever holds it signs in as {{name}} until it expires.",
+                { name }
+              ),
+              true
+            ))
+          ) {
+            return;
+          }
+          try {
+            const ticket = await invoke<string>("get_auth_ticket", {
+              userId: single.UserID,
+            });
+            await copyToClipboard(ticket, t("auth ticket"));
+          } catch (e) {
+            store.addToast(t("Error: {{error}}", { error: String(e) }));
+          }
+        },
+      },
+      {
+        label: t("View/Edit Fields"),
+        devOnly: true,
+        action: () => {
+          if (!single) return;
+          store.setAccountFieldsOpen(true);
+        },
+      },
+      { separator: true, label: "" }
+    );
+  }
+
+  items.push(
+    {
+      label: t("Remove Account"),
+      className: "text-red-400",
+      action: async () => {
+        const msg =
+          accounts.length === 1
+            ? t("Remove {{name}}?", { name: accountLabel(single, store) })
+            : t("Remove {{count}} accounts?", { count: accounts.length });
+        if (await confirm(msg, true)) {
+          store.removeAccounts(userIds, { report: userIds.length > 1 });
+        }
+      },
+    },
+    { separator: true, label: "" },
+    { label: t("Move to Group"), submenu: moveToGroupSubmenu },
+    {
+      label: t("Copy Group"),
+      action: () => {
+        if (!single) return;
+        copyToClipboard(single.Group || "Default", t("group"));
+      },
+    },
+    {
+      label: t("Sort Alphabetically"),
+      action: () => {
+        if (!single) return;
+        store.sortGroupAlphabetically(single.Group || "Default");
+      },
+    },
+    // O `Default` não se renomeia (é o grupo implícito): o item nem aparece.
+    ...(single && canRenameGroup(single.Group || "Default")
+      ? [
+          {
+            label: t("Rename Group..."),
+            action: () => void renameGroup(single.Group),
+          },
+        ]
+      : []),
+    {
+      label: t("Toggle Group Visibility"),
+      action: () => {
+        store.setShowGroups(!store.showGroups);
+      },
+    },
+    { separator: true, label: "" },
+    {
+      label: t("Show Details"),
+      action: () => {
+        if (!single) return;
+        // Com "Names hidden" ligado os nomes saem mascarados aqui também: o
+        // modal de detalhes é tela como qualquer outra.
+        const hide = (value: string) => maskAccountName(value, store.hideUsernames, store.hiddenNameLetters);
+        const details = {
+          Username: hide(single.Username),
+          UserID: single.UserID,
+          Alias: single.Alias ? hide(single.Alias) : single.Alias,
+          Description: single.Description,
+          Group: single.Group,
+          Valid: single.Valid,
+          LastUse: single.LastUse,
+          LastAttemptedRefresh: single.LastAttemptedRefresh,
+          Fields: single.Fields,
+          BrowserTrackerID: single.BrowserTrackerID,
+          HasPassword: !!single.Password,
+          HasCookie: !!single.SecurityToken,
+        };
+        store.showModal(accountLabel(single, store), JSON.stringify(details, null, 2));
+      },
+    },
+    {
+      label: t("Quick Login"),
+      action: async () => {
+        if (!single) return;
+        // Nome que aparece no prompt/toast: o mesmo rótulo da linha da conta.
+        const name = accountLabel(single, store);
+        let code = "";
+        // O código já copiado é usado sem perguntar nada — e era isso que
+        // acontecia em silêncio. Guardamos de onde ele veio para o toast dizer.
+        let fromClipboard = false;
+        try {
+          const clip = await navigator.clipboard.readText();
+          const normalizedClipCode = normalizeQuickLoginCode(clip);
+          if (normalizedClipCode.length === 6) {
+            code = normalizedClipCode;
+            fromClipboard = true;
+          }
+        } catch {}
+        if (!code) {
+          // O código não é gerado aqui: quem mostra é o roblox.com/login aberto
+          // no aparelho que vai entrar. O app só o envia com a sessão desta
+          // conta (`quick_login_enter_code` → auth-token-service/enterCode).
+          const input = await prompt(
+            t(
+              'Enter the 6-digit code that roblox.com/login shows on the device you want to sign in (the "log in with a code" option). This app sends it using {{account}}\'s session, so that device signs in as {{account}}:',
+              { account: name }
+            )
+          );
+          if (!input) return;
+          code = normalizeQuickLoginCode(input);
+        }
+        if (code.length !== 6) {
+          store.addToast(t("Invalid code (must be 6 digits)"));
+          return;
+        }
+        try {
+          await invoke("quick_login_enter_code", {
+            userId: single.UserID,
+            code,
+          });
+          store.addToast(
+            fromClipboard
+              ? t("Quick login code from your clipboard entered as {{account}}", {
+                  account: name,
+                })
+              : t("Quick login code entered as {{account}}", { account: name })
+          );
+        } catch (e) {
+          store.addToast(t("Quick login failed: {{error}}", { error: String(e) }));
+        }
+      },
+    }
+  );
+
+  const pos = store.contextMenu;
+
+  return (
+    <div
+      ref={ref}
+      className="theme-modal-scope theme-panel theme-border fixed z-50 min-w-[220px] bg-zinc-900/95 backdrop-blur-xl border border-zinc-700/50 rounded-xl shadow-2xl py-1.5 animate-scale-in"
+      style={{
+        left: menuPos?.left ?? pos.x,
+        top: menuPos?.top ?? pos.y,
+      }}
+    >
+      {items
+        .filter((item) => !item.devOnly || store.devMode)
+        .map((item, i) => (
+          <MenuItemView key={i} item={item} close={store.closeContextMenu} />
+        ))}
+    </div>
+  );
+}

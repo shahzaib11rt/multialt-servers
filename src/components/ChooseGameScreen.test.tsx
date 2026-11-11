@@ -1,0 +1,1418 @@
+import "@testing-library/jest-dom/vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+
+vi.mock("../store", async () => (await import("../test-utils/renderWithStore")).storeModuleMock());
+vi.mock("@tauri-apps/api/core", async () => (await import("../test-utils/tauriMocks")).tauriCoreMock());
+vi.mock("@tauri-apps/api/event", async () => (await import("../test-utils/tauriMocks")).tauriEventMock());
+vi.mock("../hooks/usePrompt", async () => (await import("../test-utils/promptMocks")).promptModuleMock());
+
+import { ChooseGameScreen, resetLaunchesPreparingForTests } from "./ChooseGameScreen";
+import { saveRecentGames } from "./server-list/types";
+import { defaultSettings, makeAccount, setStore } from "../test-utils/renderWithStore";
+import { emitTauriEvent, invokeMock, resetTauriMocks, setInvokeHandler } from "../test-utils/tauriMocks";
+import { promptAnswers, resetPromptMocks } from "../test-utils/promptMocks";
+import type { JoinTarget } from "../types";
+import type { StoreValue } from "../store";
+import { walkTour } from "../test-utils/tourHelpers";
+import { ScreenTourHost } from "./tour/ScreenTour";
+
+function joinTarget(overrides: Partial<JoinTarget> = {}): JoinTarget {
+  return {
+    kind: "place",
+    placeId: 606849621,
+    jobId: "",
+    accessCode: "",
+    linkCode: "",
+    launchData: "",
+    inviterId: null,
+    note: null,
+    ...overrides,
+  };
+}
+
+const ACCOUNT_A = makeAccount({ UserID: 1001, Username: "alpha" });
+const ACCOUNT_B = makeAccount({ UserID: 1002, Username: "bravo" });
+
+/** Renders the screen with `selected` accounts and opens the Follow tab. */
+/** As configurações padrão do teste com o toggle "Join by following" escolhido. */
+function withJoinByFollowing(on: boolean) {
+  const settings = defaultSettings();
+  return { ...settings, General: { ...settings.General, JoinFriendsByFollowing: on ? "true" : "false" } };
+}
+
+/**
+ * A aba Seguir. `byFollowing` = o toggle "Join by following" (padrão ligado
+ * desde 14/10/2026); os testes do pedido do servidor exato o desligam.
+ */
+async function renderFollowTab(selected = [ACCOUNT_A, ACCOUNT_B], byFollowing = false): Promise<StoreValue> {
+  const store = setStore({
+    accounts: [ACCOUNT_A, ACCOUNT_B],
+    selectedIds: new Set(selected.map((a) => a.UserID)),
+    selectedAccounts: selected,
+    settings: withJoinByFollowing(byFollowing),
+  });
+  render(<ChooseGameScreen />);
+  await userEvent.click(screen.getByRole("button", { name: "Follow" }));
+  return store;
+}
+
+function linkInput(): HTMLInputElement {
+  return screen.getByPlaceholderText(/ExperienceInvite/) as HTMLInputElement;
+}
+
+function joinButton(): HTMLButtonElement {
+  return screen.getByRole("button", { name: "Join" }) as HTMLButtonElement;
+}
+
+beforeEach(() => {
+  resetTauriMocks();
+  resetPromptMocks();
+  resetLaunchesPreparingForTests();
+  localStorage.clear();
+});
+
+afterEach(cleanup);
+
+describe("ChooseGameScreen — JoinLinkSection", () => {
+  it("resolves the pasted link with the first selected account and launches everyone", async () => {
+    setInvokeHandler((cmd) => {
+      if (cmd === "resolve_join_link") return joinTarget({ kind: "job", jobId: "job-1" });
+      return undefined;
+    });
+    const store = await renderFollowTab();
+
+    await userEvent.type(linkInput(), "https://www.roblox.com/games/606849621");
+    await userEvent.click(joinButton());
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("resolve_join_link", {
+        userId: 1001,
+        link: "https://www.roblox.com/games/606849621",
+      })
+    );
+    await waitFor(() =>
+      expect(store.launchMultiple).toHaveBeenCalledWith([1001, 1002], {
+        placeId: "606849621",
+        jobId: "job-1",
+        launchData: undefined,
+        joinVip: undefined,
+        linkCode: undefined,
+      })
+    );
+  });
+
+  it("uses joinServer when exactly one account is selected", async () => {
+    setInvokeHandler(() => joinTarget({ kind: "place" }));
+    const store = await renderFollowTab([ACCOUNT_A]);
+
+    await userEvent.type(linkInput(), "roblox://placeId=606849621");
+    await userEvent.click(joinButton());
+
+    await waitFor(() => expect(store.joinServer).toHaveBeenCalledTimes(1));
+    expect(store.joinServer).toHaveBeenCalledWith(1001, expect.objectContaining({ placeId: "606849621" }));
+    expect(store.launchMultiple).not.toHaveBeenCalled();
+  });
+
+  it("sends a private server as joinVip + linkCode and mirrors it into the Job ID field", async () => {
+    setInvokeHandler(() =>
+      joinTarget({ kind: "private", linkCode: "abc123", jobId: "ignored-job" })
+    );
+    const store = await renderFollowTab();
+
+    await userEvent.type(linkInput(), "https://www.roblox.com/share?code=abc123&type=Server");
+    await userEvent.click(joinButton());
+
+    await waitFor(() =>
+      expect(store.launchMultiple).toHaveBeenCalledWith([1001, 1002], {
+        placeId: "606849621",
+        jobId: "",
+        launchData: undefined,
+        joinVip: true,
+        linkCode: "abc123",
+      })
+    );
+    expect(store.setJobId).toHaveBeenCalledWith("vip:abc123");
+  });
+
+  it("falls back to accessCode when the private link carries no linkCode", async () => {
+    setInvokeHandler(() => joinTarget({ kind: "private", accessCode: "access-9" }));
+    const store = await renderFollowTab();
+
+    await userEvent.type(linkInput(), "vip-link");
+    await userEvent.click(joinButton());
+
+    await waitFor(() =>
+      expect(store.launchMultiple).toHaveBeenCalledWith(
+        [1001, 1002],
+        expect.objectContaining({ joinVip: true, linkCode: "access-9" })
+      )
+    );
+  });
+
+  it("forwards launchData from an invite", async () => {
+    setInvokeHandler(() =>
+      joinTarget({ kind: "invite", jobId: "job-7", launchData: "payload" })
+    );
+    const store = await renderFollowTab();
+
+    await userEvent.type(linkInput(), "https://ro.blox.com/Ebh5");
+    await userEvent.click(joinButton());
+
+    await waitFor(() =>
+      expect(store.launchMultiple).toHaveBeenCalledWith(
+        [1001, 1002],
+        expect.objectContaining({ jobId: "job-7", launchData: "payload" })
+      )
+    );
+  });
+
+  it.each([
+    ["invite", { kind: "invite" as const, jobId: "job-1" }, "Invite · place 606849621 · server job-1"],
+    ["private", { kind: "private" as const, linkCode: "abc" }, "Private server · place 606849621"],
+    ["job", { kind: "job" as const, jobId: "job-2" }, "Server · place 606849621 · server job-2"],
+    ["place", { kind: "place" as const }, "Game · place 606849621"],
+  ])("renders the resolved summary for a %s link", async (_kind, overrides, expected) => {
+    setInvokeHandler(() => joinTarget(overrides));
+    await renderFollowTab();
+
+    await userEvent.type(linkInput(), "some-link");
+    await userEvent.click(joinButton());
+
+    expect(await screen.findByText(expected)).toBeInTheDocument();
+  });
+
+  it("shows the expiry warning but still launches when the target carries a note", async () => {
+    setInvokeHandler(() => joinTarget({ kind: "place", note: "Expired" }));
+    const store = await renderFollowTab();
+
+    await userEvent.type(linkInput(), "https://www.roblox.com/share?code=old");
+    await userEvent.click(joinButton());
+
+    expect(await screen.findByText(/no longer valid \(Expired\)/i)).toBeInTheDocument();
+    await waitFor(() => expect(store.launchMultiple).toHaveBeenCalledTimes(1));
+  });
+
+  it("shows a backend error inline and keeps the typed link", async () => {
+    setInvokeHandler(() => {
+      throw new Error("link expired or invalid");
+    });
+    const store = await renderFollowTab();
+
+    await userEvent.type(linkInput(), "https://bad.link/x");
+    await userEvent.click(joinButton());
+
+    expect(await screen.findByText(/link expired or invalid/i)).toBeInTheDocument();
+    expect(linkInput()).toHaveValue("https://bad.link/x");
+    expect(store.launchMultiple).not.toHaveBeenCalled();
+    // Re-enabled after the failure so the user can retry.
+    await waitFor(() => expect(joinButton()).toBeEnabled());
+  });
+
+  it("surfaces a launch failure inline without clearing the link", async () => {
+    setInvokeHandler(() => joinTarget({ kind: "place" }));
+    const store = await renderFollowTab();
+    (store.launchMultiple as ReturnType<typeof vi.fn>).mockRejectedValue(new Error("multi roblox off"));
+
+    await userEvent.type(linkInput(), "https://www.roblox.com/games/1");
+    await userEvent.click(joinButton());
+
+    expect(await screen.findByText(/multi roblox off/i)).toBeInTheDocument();
+    expect(linkInput()).toHaveValue("https://www.roblox.com/games/1");
+  });
+
+  it("explica a recusa por launch já em andamento sem repetir o toast do store", async () => {
+    // O store já avisou (é ele que traduz o código do backend). A tela mostra a
+    // frase na linha inline e não empilha um "Launch failed: <código>" em cima.
+    setInvokeHandler(() => joinTarget({ kind: "place" }));
+    const store = await renderFollowTab();
+    (store.launchMultiple as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error("launch-already-active")
+    );
+
+    await userEvent.type(linkInput(), "https://www.roblox.com/games/1");
+    await userEvent.click(joinButton());
+
+    expect(await screen.findByText(/A launch is already in progress/i)).toBeInTheDocument();
+    expect(store.addToast).not.toHaveBeenCalled();
+  });
+
+  it("submits on Enter", async () => {
+    setInvokeHandler(() => joinTarget({ kind: "place" }));
+    const store = await renderFollowTab();
+
+    await userEvent.type(linkInput(), "https://www.roblox.com/games/606849621{Enter}");
+
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("resolve_join_link", expect.anything()));
+    await waitFor(() => expect(store.launchMultiple).toHaveBeenCalledTimes(1));
+  });
+
+  it("keeps Join disabled until a link is typed", async () => {
+    await renderFollowTab();
+    expect(joinButton()).toBeDisabled();
+
+    await userEvent.type(linkInput(), "  ");
+    expect(joinButton()).toBeDisabled();
+
+    await userEvent.type(linkInput(), "link");
+    expect(joinButton()).toBeEnabled();
+  });
+
+  it("keeps Join disabled while no account is selected", async () => {
+    await renderFollowTab([]);
+    await userEvent.type(linkInput(), "link");
+    expect(joinButton()).toBeDisabled();
+  });
+
+  it("disables the input and the button while the link is resolving", async () => {
+    let release: (value: JoinTarget) => void = () => {};
+    setInvokeHandler(
+      () => new Promise<JoinTarget>((resolve) => { release = resolve; })
+    );
+    await renderFollowTab();
+
+    await userEvent.type(linkInput(), "link");
+    await userEvent.click(joinButton());
+
+    expect(await screen.findByRole("button", { name: "Resolving link..." })).toBeDisabled();
+    expect(linkInput()).toBeDisabled();
+
+    release(joinTarget());
+    await waitFor(() => expect(joinButton()).toBeEnabled());
+  });
+
+  it("labels the section with the selected account count", async () => {
+    await renderFollowTab();
+    expect(screen.getAllByText("2 accounts").length).toBeGreaterThan(0);
+
+    cleanup();
+    await renderFollowTab([ACCOUNT_A]);
+    expect(screen.getAllByText("1 account").length).toBeGreaterThan(0);
+  });
+});
+
+describe("ChooseGameScreen — FollowTab, join by following", () => {
+  it("follows the player with every account, without a server ID, even for one account", async () => {
+    setInvokeHandler((cmd) => {
+      if (cmd === "lookup_user") return { id: 42 };
+      if (cmd === "get_presence") return [{ userPresenceType: 2, placeId: 111, rootPlaceId: 606849621, gameId: "job-x" }];
+      return undefined;
+    });
+    const store = await renderFollowTab([ACCOUNT_A], true);
+    await userEvent.type(screen.getByPlaceholderText("e.g. Builderman"), "Builderman");
+    const buttons = screen.getAllByRole("button", { name: "Follow" });
+    await userEvent.click(buttons[buttons.length - 1]);
+
+    await waitFor(() => expect(store.launchMultiple).toHaveBeenCalledTimes(1));
+    expect(store.launchMultiple).toHaveBeenCalledWith([ACCOUNT_A.UserID], expect.objectContaining({ followUserId: 42, jobId: "" }));
+    expect(store.joinServer).not.toHaveBeenCalled();
+  });
+
+  it("still follows when the player's server is hidden, and stops only when offline", async () => {
+    let presenceType = 1;
+    setInvokeHandler((cmd) => {
+      if (cmd === "lookup_user") return { id: 42 };
+      if (cmd === "get_presence") return [{ userPresenceType: presenceType, placeId: null, rootPlaceId: null, gameId: null }];
+      return undefined;
+    });
+    const store = await renderFollowTab([ACCOUNT_A, ACCOUNT_B], true);
+    await userEvent.type(screen.getByPlaceholderText("e.g. Builderman"), "Builderman");
+    const buttons = screen.getAllByRole("button", { name: "Follow" });
+    await userEvent.click(buttons[buttons.length - 1]);
+    await waitFor(() => expect(store.launchMultiple).toHaveBeenCalledTimes(1));
+
+    presenceType = 0;
+    await userEvent.click(buttons[buttons.length - 1]);
+    await waitFor(() => expect(store.addToast).toHaveBeenCalledWith(expect.stringContaining("is not in a game")));
+    expect(store.launchMultiple).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * "Wait until they're in a game": jogador fora de jogo vira uma espera que
+ * consulta a presença a cada 30 s e lança as contas uma vez quando dá.
+ */
+describe("ChooseGameScreen — FollowTab, wait for the player", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function presenceCalls() {
+    return invokeMock.mock.calls.filter((call) => call[0] === "get_presence").length;
+  }
+
+  async function followOffline(user: ReturnType<typeof userEvent.setup>) {
+    await user.type(screen.getByPlaceholderText("e.g. Builderman"), "Builderman");
+    const buttons = screen.getAllByRole("button", { name: "Follow" });
+    await user.click(buttons[buttons.length - 1]);
+    return await screen.findByRole("button", { name: "Wait until they're in a game" });
+  }
+
+  it("offers to wait, keeps watching across tabs and stops on Cancel", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+    setInvokeHandler((cmd) => {
+      if (cmd === "lookup_user") return { id: 42 };
+      if (cmd === "get_presence") return [{ userId: 42, userPresenceType: 0 }];
+      return undefined;
+    });
+    const store = setStore({
+      accounts: [ACCOUNT_A, ACCOUNT_B],
+      selectedIds: new Set([1001, 1002]),
+      selectedAccounts: [ACCOUNT_A, ACCOUNT_B],
+      settings: withJoinByFollowing(true),
+    });
+    render(<ChooseGameScreen />);
+    await user.click(screen.getByRole("button", { name: "Follow" }));
+
+    await user.click(await followOffline(user));
+    expect(screen.getByTestId("follow-wait-status")).toHaveTextContent("Watching Builderman… (checks every 30 s)");
+
+    // Trocar de aba não para a espera.
+    await user.click(screen.getByRole("button", { name: "Favorites" }));
+    const before = presenceCalls();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(presenceCalls()).toBe(before + 1);
+    await user.click(screen.getByRole("button", { name: "Follow" }));
+    expect(screen.getByTestId("follow-wait-status")).toBeInTheDocument();
+
+    await user.click(within(screen.getByTestId("follow-wait-status")).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByTestId("follow-wait-status")).toBeNull();
+    const afterCancel = presenceCalls();
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(presenceCalls()).toBe(afterCancel);
+    expect(store.launchMultiple).not.toHaveBeenCalled();
+  });
+
+  it("launches every selected account once when the player joins a game, then stops", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+    let type = 0;
+    setInvokeHandler((cmd) => {
+      if (cmd === "lookup_user") return { id: 42 };
+      if (cmd === "get_presence") return [{ userId: 42, userPresenceType: type, rootPlaceId: 606849621, placeId: 111, gameId: null }];
+      return undefined;
+    });
+    const store = await renderFollowTab([ACCOUNT_A, ACCOUNT_B], true);
+
+    await user.click(await followOffline(user));
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(store.launchMultiple).not.toHaveBeenCalled();
+
+    type = 2;
+    await vi.advanceTimersByTimeAsync(30_000);
+    await waitFor(() => expect(store.launchMultiple).toHaveBeenCalledTimes(1));
+    expect(store.launchMultiple).toHaveBeenCalledWith(
+      [1001, 1002],
+      expect.objectContaining({ placeId: "606849621", jobId: "", followUserId: 42 })
+    );
+
+    const calls = presenceCalls();
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(presenceCalls()).toBe(calls);
+    expect(store.launchMultiple).toHaveBeenCalledTimes(1);
+  });
+
+  it("closing Choose Game stops the wait", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+    setInvokeHandler((cmd) => {
+      if (cmd === "lookup_user") return { id: 42 };
+      if (cmd === "get_presence") return [{ userId: 42, userPresenceType: 0 }];
+      return undefined;
+    });
+    await renderFollowTab([ACCOUNT_A], true);
+    await user.click(await followOffline(user));
+    cleanup();
+    const calls = presenceCalls();
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(presenceCalls()).toBe(calls);
+  });
+});
+
+describe("ChooseGameScreen — FollowTab", () => {
+  /** O botão "Follow" do formulário (o primeiro com esse nome é a aba). */
+  function followButton(): HTMLButtonElement {
+    const buttons = screen.getAllByRole("button", { name: "Follow" });
+    return buttons[buttons.length - 1] as HTMLButtonElement;
+  }
+
+  function presence(overrides: Record<string, unknown> = {}) {
+    return [{ userPresenceType: 2, placeId: 111, rootPlaceId: 606849621, gameId: "job-x", ...overrides }];
+  }
+
+  it("não anuncia que está seguindo quando o launch de UMA conta é recusado", async () => {
+    // Uma conta vai por `joinServer`. Se a recusa for engolida, `launchAll`
+    // devolve ok e a tela mostra "Following ... with 1 account(s)..." em cima do
+    // aviso "Já existe um launch em andamento".
+    setInvokeHandler((cmd) => {
+      if (cmd === "lookup_user") return { id: 42 };
+      if (cmd === "get_presence") return presence();
+      return undefined;
+    });
+    const store = await renderFollowTab([ACCOUNT_A]);
+    (store.joinServer as ReturnType<typeof vi.fn>).mockResolvedValue("refused");
+
+    await userEvent.type(screen.getByPlaceholderText("e.g. Builderman"), "Builderman");
+    await userEvent.click(followButton());
+
+    await waitFor(() => expect(store.joinServer).toHaveBeenCalledTimes(1));
+    expect(store.addToast).not.toHaveBeenCalled();
+  });
+
+  it("não anuncia que está seguindo quando o launch de UMA conta falha", async () => {
+    // Mesma forma, um degrau ao lado: erro comum (ex.: `version-conflict`) põe a
+    // faixa vermelha, e anunciar "Following ..." em cima dela é a tela mentindo.
+    setInvokeHandler((cmd) => {
+      if (cmd === "lookup_user") return { id: 42 };
+      if (cmd === "get_presence") return presence();
+      return undefined;
+    });
+    const store = await renderFollowTab([ACCOUNT_A]);
+    (store.joinServer as ReturnType<typeof vi.fn>).mockResolvedValue("failed");
+
+    await userEvent.type(screen.getByPlaceholderText("e.g. Builderman"), "Builderman");
+    await userEvent.click(followButton());
+
+    await waitFor(() => expect(store.joinServer).toHaveBeenCalledTimes(1));
+    expect(store.addToast).not.toHaveBeenCalled();
+  });
+
+  it("resolves the target once and launches every account through the batch launcher", async () => {
+    setInvokeHandler((cmd) => {
+      if (cmd === "lookup_user") return { id: 42 };
+      if (cmd === "get_presence") return presence();
+      return undefined;
+    });
+    const store = await renderFollowTab();
+
+    await userEvent.type(screen.getByPlaceholderText("e.g. Builderman"), "Builderman");
+    await userEvent.click(followButton());
+
+    // O place do servidor (111), não o raiz: o Job ID é de um servidor dele.
+    await waitFor(() =>
+      expect(store.launchMultiple).toHaveBeenCalledWith(
+        [1001, 1002],
+        expect.objectContaining({ placeId: "111", jobId: "job-x" })
+      )
+    );
+    expect(store.launchMultiple).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * Regressão: o Follow já lançou conta por conta com `launch_roblox` e
+   * `sleep(3000)`, furando o piso anti-captcha de 8 s que `launch_multiple`
+   * aplica no backend. Nada aqui pode voltar a lançar em laço.
+   */
+  it("never calls launch_roblox in a loop", async () => {
+    setInvokeHandler((cmd) => {
+      if (cmd === "lookup_user") return { id: 42 };
+      if (cmd === "get_presence") return presence();
+      return undefined;
+    });
+    await renderFollowTab();
+
+    await userEvent.type(screen.getByPlaceholderText("e.g. Builderman"), "Builderman");
+    await userEvent.click(followButton());
+
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("get_presence", expect.anything()));
+    expect(invokeMock.mock.calls.filter((call) => call[0] === "launch_roblox")).toHaveLength(0);
+  });
+
+  it("does not launch when the target is not in a game", async () => {
+    setInvokeHandler((cmd) => {
+      if (cmd === "lookup_user") return { id: 42 };
+      if (cmd === "get_presence") return presence({ userPresenceType: 1, gameId: null, rootPlaceId: null, placeId: null });
+      return undefined;
+    });
+    const store = await renderFollowTab();
+
+    await userEvent.type(screen.getByPlaceholderText("e.g. Builderman"), "Builderman");
+    await userEvent.click(followButton());
+
+    await waitFor(() => expect(store.addToast).toHaveBeenCalled());
+    expect(store.launchMultiple).not.toHaveBeenCalled();
+    expect(store.joinServer).not.toHaveBeenCalled();
+    expect(invokeMock.mock.calls.filter((call) => call[0] === "launch_roblox")).toHaveLength(0);
+  });
+
+  /**
+   * O card promete: servidor escondido pela privacidade → pergunta antes de cair
+   * num servidor público do mesmo jogo. Sem `PromptProvider`, `confirm()`
+   * resolve `false` — então aqui nada pode ser aberto.
+   */
+  it("com o servidor escondido, não cai num servidor público sem perguntar", async () => {
+    setInvokeHandler((cmd) => {
+      if (cmd === "lookup_user") return { id: 42 };
+      if (cmd === "get_presence") return presence({ gameId: "" });
+      return undefined;
+    });
+    const store = await renderFollowTab();
+
+    await userEvent.type(screen.getByPlaceholderText("e.g. Builderman"), "Builderman");
+    await userEvent.click(followButton());
+
+    // O campo volta a ficar habilitado no `finally`: o fluxo inteiro terminou.
+    await waitFor(() => expect(screen.getByPlaceholderText("e.g. Builderman")).toBeEnabled());
+    expect(invokeMock).toHaveBeenCalledWith("get_presence", expect.anything());
+    expect(store.launchMultiple).not.toHaveBeenCalled();
+    expect(store.joinServer).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Com Job ID, o place tem que ser o do servidor (`placeId`): num jogo com
+   * sub-places, o raiz + o Job ID de um sub-place pede um servidor que não
+   * existe no raiz e o cliente abre em "This experience has ended".
+   */
+  it("joins the place the player's server is in when there is a Job ID", async () => {
+    setInvokeHandler((cmd) => {
+      if (cmd === "lookup_user") return { id: 42 };
+      if (cmd === "get_presence") return presence({ rootPlaceId: 999, placeId: 111 });
+      return undefined;
+    });
+    const store = await renderFollowTab();
+
+    await userEvent.type(screen.getByPlaceholderText("e.g. Builderman"), "Builderman");
+    await userEvent.click(followButton());
+
+    await waitFor(() =>
+      expect(store.launchMultiple).toHaveBeenCalledWith(
+        [1001, 1002],
+        expect.objectContaining({ placeId: "111", jobId: "job-x" })
+      )
+    );
+  });
+
+  /**
+   * Sem Job ID (servidor escondido) entra-se num servidor público **do jogo**, e
+   * aí o place é o raiz: um sub-place de teleporte pode não aceitar entrada
+   * direta.
+   */
+  it("joins a public server of the root place when the server is hidden", async () => {
+    promptAnswers.confirm = true;
+    setInvokeHandler((cmd) => {
+      if (cmd === "lookup_user") return { id: 42 };
+      if (cmd === "get_presence") return presence({ rootPlaceId: 999, placeId: 111, gameId: "" });
+      return undefined;
+    });
+    const store = await renderFollowTab();
+
+    await userEvent.type(screen.getByPlaceholderText("e.g. Builderman"), "Builderman");
+    await userEvent.click(followButton());
+
+    await waitFor(() =>
+      expect(store.launchMultiple).toHaveBeenCalledWith(
+        [1001, 1002],
+        expect.objectContaining({ placeId: "999", jobId: "" })
+      )
+    );
+  });
+});
+
+describe("ChooseGameScreen — Recent tab", () => {
+  /**
+   * A dica da aba promete "use Join Game to launch directly" — e na aba Games é
+   * o que o botão faz. Nos Recentes ele caía no mesmo caminho do clique no
+   * card, que só abre a aba Servers.
+   */
+  it("o Join Game de um jogo recente entra no jogo com as contas selecionadas", async () => {
+    saveRecentGames([{ placeId: 606849621, name: "Jailbreak", iconUrl: "icon.png", lastPlayed: Date.now() }]);
+    const store = setStore({
+      accounts: [ACCOUNT_A, ACCOUNT_B],
+      selectedIds: new Set([1001, 1002]),
+      selectedAccounts: [ACCOUNT_A, ACCOUNT_B],
+    });
+    render(<ChooseGameScreen />);
+
+    await userEvent.click(screen.getByRole("button", { name: "Recent" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Join Game" }));
+
+    await waitFor(() =>
+      expect(store.launchMultiple).toHaveBeenCalledWith(
+        [1001, 1002],
+        expect.objectContaining({ placeId: "606849621" })
+      )
+    );
+    // Lançou: vai para a Sessão, onde a preparação e a fila aparecem (pedido
+    // do dono, 15/10/2026). A Escolher jogo fecha junto — o problema de 12/10
+    // era ela ficar aberta por baixo e reabrir com o lote anterior.
+    expect(store.setChooseGameOpen).toHaveBeenCalledWith(false);
+    expect(store.setActivePage).toHaveBeenCalledWith("session");
+  });
+
+  /**
+   * Relato do dono (15/10/2026): o clique em Entrar não respondia por alguns
+   * segundos (conferindo presença, escolhendo servidor); o segundo clique
+   * abria a mesma conta de novo e o Roblox derrubava uma (erro 276).
+   */
+  it("goes to the Session right on the click and shows the preparation", async () => {
+    saveRecentGames([{ placeId: 606849621, name: "Jailbreak", iconUrl: "icon.png", lastPlayed: Date.now() }]);
+    let releasePick: (v: unknown) => void = () => {};
+    setInvokeHandler((cmd) => (cmd === "pick_server" ? new Promise((r) => (releasePick = r)) : undefined));
+    const store = setStore({
+      accounts: [ACCOUNT_A, ACCOUNT_B],
+      selectedIds: new Set([1001, 1002]),
+      selectedAccounts: [ACCOUNT_A, ACCOUNT_B],
+    });
+    render(<ChooseGameScreen />);
+    await userEvent.click(screen.getByRole("button", { name: "Recent" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Join Game" }));
+
+    // Ainda procurando o servidor: a tela já foi para a Sessão.
+    await waitFor(() => expect(store.setActivePage).toHaveBeenCalledWith("session"));
+    expect(store.setChooseGameOpen).toHaveBeenCalledWith(false);
+    await waitFor(() =>
+      expect(store.setLaunchPreparing).toHaveBeenCalledWith({ userIds: [1001, 1002], step: "server" })
+    );
+    expect(store.launchMultiple).not.toHaveBeenCalled();
+
+    releasePick({ jobId: "job-picked", regionFallback: false });
+    await waitFor(() => expect(store.launchMultiple).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(store.setLaunchPreparing).toHaveBeenLastCalledWith(null));
+  });
+
+  it("a second click while the launch is still being prepared does not open the accounts again", async () => {
+    saveRecentGames([{ placeId: 606849621, name: "Jailbreak", iconUrl: "icon.png", lastPlayed: Date.now() }]);
+    let releasePick: (v: unknown) => void = () => {};
+    setInvokeHandler((cmd) => (cmd === "pick_server" ? new Promise((r) => (releasePick = r)) : undefined));
+    const store = setStore({
+      accounts: [ACCOUNT_A, ACCOUNT_B],
+      selectedIds: new Set([1001, 1002]),
+      selectedAccounts: [ACCOUNT_A, ACCOUNT_B],
+    });
+    render(<ChooseGameScreen />);
+    await userEvent.click(screen.getByRole("button", { name: "Recent" }));
+    const join = await screen.findByRole("button", { name: "Join Game" });
+    await userEvent.click(join);
+    await userEvent.click(join);
+
+    expect(store.addToast).toHaveBeenCalledWith("This launch is already starting");
+    releasePick({ jobId: "job-picked", regionFallback: false });
+    await waitFor(() => expect(store.launchMultiple).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(store.setLaunchPreparing).toHaveBeenLastCalledWith(null));
+  });
+
+  /**
+   * Entrada rápida (Favoritos/Jogos/Recentes) com UMA conta: nada de procurar
+   * servidor — o Roblox escolhe na hora (pedido do dono, 15/10/2026: era aqui
+   * que o clique demorava).
+   */
+  it("a quick join with one account goes straight in without searching for a server", async () => {
+    saveRecentGames([{ placeId: 606849621, name: "Jailbreak", iconUrl: "icon.png", lastPlayed: Date.now() }]);
+    const store = setStore({
+      accounts: [ACCOUNT_A],
+      selectedIds: new Set([1001]),
+      selectedAccounts: [ACCOUNT_A],
+      serverPreference: "bestfit",
+      serverRegionFilter: "BR",
+    });
+    render(<ChooseGameScreen />);
+    await userEvent.click(screen.getByRole("button", { name: "Recent" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Join Game" }));
+
+    await waitFor(() =>
+      expect(store.joinServer).toHaveBeenCalledWith(1001, expect.objectContaining({ placeId: "606849621", jobId: "" }))
+    );
+    expect(invokeMock).not.toHaveBeenCalledWith("pick_server", expect.anything());
+  });
+
+  /** Várias contas na entrada rápida: só o mesmo servidor com vaga, sem os filtros da aba Servidores. */
+  it("a quick join with several accounts only looks for one server that fits them all, ignoring the Servers filters", async () => {
+    saveRecentGames([{ placeId: 606849621, name: "Jailbreak", iconUrl: "icon.png", lastPlayed: Date.now() }]);
+    setInvokeHandler((cmd) => (cmd === "pick_server" ? { jobId: "job-fit", regionFallback: false } : undefined));
+    const store = setStore({
+      accounts: [ACCOUNT_A, ACCOUNT_B],
+      selectedIds: new Set([1001, 1002]),
+      selectedAccounts: [ACCOUNT_A, ACCOUNT_B],
+      serverPreference: "random",
+      serverRegionFilter: "BR",
+    });
+    render(<ChooseGameScreen />);
+    await userEvent.click(screen.getByRole("button", { name: "Recent" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Join Game" }));
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith(
+        "pick_server",
+        expect.objectContaining({ preference: "bestfit", countryCode: null, accounts: 2 })
+      )
+    );
+    await waitFor(() =>
+      expect(store.launchMultiple).toHaveBeenCalledWith(
+        [1001, 1002],
+        expect.objectContaining({ jobId: "job-fit" })
+      )
+    );
+  });
+});
+
+describe("ChooseGameScreen — Friends tab", () => {
+  it("shows a Friends tab that groups the online friends per selected account", async () => {
+    setInvokeHandler((cmd) => {
+      if (cmd === "get_online_friends_for_accounts") {
+        return [
+          {
+            userId: 1001,
+            error: null,
+            friends: [
+              {
+                userId: 7001,
+                name: "friendo",
+                displayName: "Friendo",
+                presenceType: 2,
+                lastLocation: "Some Game",
+                placeId: 189707,
+                rootPlaceId: 189707,
+                gameId: "job-a",
+              },
+            ],
+          },
+          { userId: 1002, error: null, friends: [] },
+        ];
+      }
+      return [];
+    });
+    setStore({
+      accounts: [ACCOUNT_A, ACCOUNT_B],
+      selectedIds: new Set([1001, 1002]),
+      selectedAccounts: [ACCOUNT_A, ACCOUNT_B],
+    });
+    render(<ChooseGameScreen />);
+
+    await userEvent.click(screen.getByRole("button", { name: "Friends" }));
+
+    expect(await screen.findByTestId("friends-group-1001")).toBeInTheDocument();
+    expect(screen.getByTestId("friends-group-1002")).toBeInTheDocument();
+    expect(screen.getByTestId("friend-1001-7001")).toBeInTheDocument();
+  });
+});
+
+/**
+ * Trocar de aba desmonta a aba anterior. A volta (ou sair da Choose Game e
+ * entrar de novo) mostrava a aba vazia, recarregando do zero; agora ela
+ * aparece com o que já tinha e atualiza por trás.
+ */
+describe("ChooseGameScreen — abas guardam o que carregaram", () => {
+  const FRIENDS = [
+    {
+      userId: 1001,
+      error: null,
+      friends: [
+        {
+          userId: 7001,
+          name: "friendo",
+          displayName: "Friendo",
+          presenceType: 2,
+          lastLocation: "Some Game",
+          placeId: 189707,
+          rootPlaceId: 189707,
+          gameId: "job-a",
+        },
+      ],
+    },
+  ];
+
+  function friendCalls() {
+    return invokeMock.mock.calls.filter((call) => call[0] === "get_online_friends_for_accounts");
+  }
+
+  function setup() {
+    setStore({
+      accounts: [ACCOUNT_A],
+      selectedIds: new Set([1001]),
+      selectedAccounts: [ACCOUNT_A],
+    });
+  }
+
+  it("volta à aba Friends com a lista anterior na tela", async () => {
+    setInvokeHandler((cmd) => (cmd === "get_online_friends_for_accounts" ? FRIENDS : []));
+    setup();
+    render(<ChooseGameScreen />);
+    await userEvent.click(screen.getByRole("button", { name: "Friends" }));
+    await screen.findByTestId("friend-1001-7001");
+
+    await userEvent.click(screen.getByRole("button", { name: "Favorites" }));
+    expect(screen.queryByTestId("friend-1001-7001")).not.toBeInTheDocument();
+
+    setInvokeHandler((cmd) =>
+      cmd === "get_online_friends_for_accounts" ? new Promise(() => {}) : []
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Friends" }));
+    expect(screen.getByTestId("friend-1001-7001")).toBeInTheDocument();
+    expect(screen.getByTestId("friends-updating-1001")).toBeInTheDocument();
+    expect(friendCalls()).toHaveLength(2);
+  });
+
+  it("sair da Choose Game e entrar de novo também mantém a lista", async () => {
+    setInvokeHandler((cmd) => (cmd === "get_online_friends_for_accounts" ? FRIENDS : []));
+    setup();
+    render(<ChooseGameScreen />);
+    await userEvent.click(screen.getByRole("button", { name: "Friends" }));
+    await screen.findByTestId("friend-1001-7001");
+    cleanup();
+
+    setInvokeHandler((cmd) =>
+      cmd === "get_online_friends_for_accounts" ? new Promise(() => {}) : []
+    );
+    setup();
+    render(<ChooseGameScreen />);
+    await userEvent.click(screen.getByRole("button", { name: "Friends" }));
+    expect(screen.getByTestId("friend-1001-7001")).toBeInTheDocument();
+  });
+});
+
+/**
+ * Preferência de servidor (Random / Emptiest / Fullest, com filtro de país).
+ *
+ * Contrato que estes testes travam: o servidor é resolvido **uma vez** para o
+ * lote — se cada conta resolvesse o seu, o lote não jogaria junto — e só quando
+ * o usuário não escolheu servidor.
+ */
+describe("ChooseGameScreen — preferência de servidor", () => {
+  function pickStore(overrides: Partial<StoreValue> = {}) {
+    return setStore({
+      accounts: [ACCOUNT_A, ACCOUNT_B],
+      selectedIds: new Set([1001, 1002]),
+      selectedAccounts: [ACCOUNT_A, ACCOUNT_B],
+      ...overrides,
+    });
+  }
+
+  async function joinPlainLink() {
+    render(<ChooseGameScreen />);
+    await userEvent.click(screen.getByRole("button", { name: "Follow" }));
+    await userEvent.type(linkInput(), "https://www.roblox.com/games/606849621");
+    await userEvent.click(joinButton());
+  }
+
+  it("resolve o servidor uma vez para o lote e lança todo mundo nele", async () => {
+    setInvokeHandler((cmd) => {
+      if (cmd === "resolve_join_link") return joinTarget({ kind: "place" });
+      if (cmd === "pick_server") {
+        return { jobId: "job-vazio", playing: 2, maxPlayers: 30, region: null, regionFallback: false };
+      }
+      return undefined;
+    });
+    const store = pickStore({ serverPreference: "emptiest", serverRegionFilter: "" });
+
+    await joinPlainLink();
+
+    await waitFor(() =>
+      expect(store.launchMultiple).toHaveBeenCalledWith(
+        [1001, 1002],
+        expect.objectContaining({ jobId: "job-vazio" })
+      )
+    );
+    const picks = invokeMock.mock.calls.filter((call) => call[0] === "pick_server");
+    expect(picks).toHaveLength(1);
+    expect(picks[0][1]).toMatchObject({
+      userId: 1001,
+      placeId: 606849621,
+      preference: "emptiest",
+      accounts: 2,
+    });
+  });
+
+  it("manda o país escolhido junto com a preferência", async () => {
+    setInvokeHandler((cmd) => {
+      if (cmd === "resolve_join_link") return joinTarget({ kind: "place" });
+      if (cmd === "pick_server") {
+        return { jobId: "job-br", playing: 4, maxPlayers: 30, region: null, regionFallback: false };
+      }
+      return undefined;
+    });
+    pickStore({ serverPreference: "emptiest", serverRegionFilter: "BR" });
+
+    await joinPlainLink();
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith(
+        "pick_server",
+        expect.objectContaining({ countryCode: "BR" })
+      )
+    );
+  });
+
+  it("não resolve nada quando o usuário pede para o Roblox escolher", async () => {
+    setInvokeHandler((cmd) => {
+      if (cmd === "resolve_join_link") return joinTarget({ kind: "place" });
+      return undefined;
+    });
+    const store = pickStore({ serverPreference: "none" });
+
+    await joinPlainLink();
+
+    await waitFor(() => expect(store.launchMultiple).toHaveBeenCalled());
+    expect(invokeMock.mock.calls.filter((call) => call[0] === "pick_server")).toHaveLength(0);
+  });
+
+  /**
+   * Bateria de testes de 25/10/2026: com "Shuffle Job ID" ligado as 4 contas
+   * caíam no mesmo servidor — a preferência (padrão "bestfit") resolvia um Job
+   * ID para o lote, e com Job ID preenchido o backend não sorteia. O shuffle
+   * pede servidores diferentes: o lote vai com Job vazio e cada conta sorteia.
+   */
+  it("com o Shuffle Job ID ligado, não escolhe um servidor único para o lote", async () => {
+    setInvokeHandler((cmd) => {
+      if (cmd === "resolve_join_link") return joinTarget({ kind: "place" });
+      if (cmd === "pick_server") {
+        return { jobId: "job-unico", playing: 2, maxPlayers: 30, region: null, regionFallback: false };
+      }
+      return undefined;
+    });
+    const store = pickStore({ serverPreference: "bestfit", shuffleJobId: true });
+
+    await joinPlainLink();
+
+    await waitFor(() =>
+      expect(store.launchMultiple).toHaveBeenCalledWith([1001, 1002], expect.objectContaining({ jobId: "" }))
+    );
+    expect(invokeMock.mock.calls.filter((call) => call[0] === "pick_server")).toHaveLength(0);
+  });
+
+  /** Job ID explícito vence a preferência: o usuário já escolheu. */
+  it("não sobrepõe um servidor que o usuário escolheu", async () => {
+    setInvokeHandler((cmd) => {
+      if (cmd === "resolve_join_link") return joinTarget({ kind: "job", jobId: "job-do-usuario" });
+      return undefined;
+    });
+    const store = pickStore({ serverPreference: "fullest" });
+
+    await joinPlainLink();
+
+    await waitFor(() =>
+      expect(store.launchMultiple).toHaveBeenCalledWith(
+        [1001, 1002],
+        expect.objectContaining({ jobId: "job-do-usuario" })
+      )
+    );
+    expect(invokeMock.mock.calls.filter((call) => call[0] === "pick_server")).toHaveLength(0);
+  });
+
+  /**
+   * Sem servidor no país pedido o backend devolve o melhor disponível marcado
+   * como fallback; entrar nele sem perguntar seria justamente o que o usuário
+   * quer evitar. Sem `PromptProvider`, `confirm()` resolve `false`.
+   */
+  it("não entra no servidor de outro país sem confirmação", async () => {
+    setInvokeHandler((cmd) => {
+      if (cmd === "resolve_join_link") return joinTarget({ kind: "place" });
+      if (cmd === "pick_server") {
+        return { jobId: "job-us", playing: 2, maxPlayers: 30, region: null, regionFallback: true };
+      }
+      return undefined;
+    });
+    const store = pickStore({ serverPreference: "emptiest", serverRegionFilter: "BR" });
+
+    await joinPlainLink();
+
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("pick_server", expect.anything()));
+    expect(store.launchMultiple).not.toHaveBeenCalled();
+    expect(store.joinServer).not.toHaveBeenCalled();
+  });
+
+  /** Falha ao escolher servidor não pode cancelar o launch. */
+  it("cai no comportamento antigo quando a escolha falha", async () => {
+    setInvokeHandler((cmd) => {
+      if (cmd === "resolve_join_link") return joinTarget({ kind: "place" });
+      if (cmd === "pick_server") throw new Error("429 Too Many Requests");
+      return undefined;
+    });
+    const store = pickStore({ serverPreference: "emptiest" });
+
+    await joinPlainLink();
+
+    await waitFor(() =>
+      expect(store.launchMultiple).toHaveBeenCalledWith(
+        [1001, 1002],
+        expect.objectContaining({ jobId: "" })
+      )
+    );
+    expect(store.addToast).toHaveBeenCalled();
+  });
+});
+
+describe("ChooseGameScreen — Servers tab", () => {
+  it("mostra a aba de servidores com o que a varredura já achou", async () => {
+    setInvokeHandler((cmd) => (cmd === "start_server_scan" ? 3 : undefined));
+    setStore({
+      accounts: [ACCOUNT_A, ACCOUNT_B],
+      selectedIds: new Set([1001, 1002]),
+      selectedAccounts: [ACCOUNT_A, ACCOUNT_B],
+      placeId: "606849621",
+    });
+    render(<ChooseGameScreen />);
+
+    await userEvent.click(screen.getByRole("button", { name: "Servers" }));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("start_server_scan", expect.anything()));
+
+    emitTauriEvent("server-scan", {
+      scanId: 3,
+      placeId: 606849621,
+      servers: [{ id: "job-listado", playing: 5, maxPlayers: 30, ping: 30 }],
+      scanned: 1,
+      fitting: 1,
+      done: true,
+      error: null,
+    });
+
+    expect(await screen.findByText("job-listado")).toBeInTheDocument();
+    expect(screen.getByText("/ 30")).toBeInTheDocument();
+  });
+
+  /** Item do usuário: do jogo direto para os servidores dele. */
+  it("abre os servidores do jogo pelo botão da aba Games", async () => {
+    setInvokeHandler((cmd) => {
+      if (cmd === "search_games") {
+        return {
+          sorts: [
+            { games: [{ rootPlaceId: 606849621, universeId: 1, name: "Jailbreak", playerCount: 10 }] },
+          ],
+        };
+      }
+      if (cmd === "start_server_scan") return 4;
+      return undefined;
+    });
+    const store = setStore({
+      accounts: [ACCOUNT_A],
+      selectedIds: new Set([1001]),
+      selectedAccounts: [ACCOUNT_A],
+    });
+    render(<ChooseGameScreen />);
+
+    await userEvent.click(screen.getByRole("button", { name: "Games" }));
+    const browse = await screen.findByRole("button", { name: /Browse servers/i });
+    await userEvent.click(browse);
+
+    // Guarda o place e troca de aba; quem lista é a própria aba Servers, com
+    // testes seus em src/components/servers.
+    expect(store.setPlaceId).toHaveBeenCalledWith("606849621");
+    expect(await screen.findByLabelText("Place ID")).toBeInTheDocument();
+  });
+
+  /**
+   * Clicar no card lançava direto (`handleSelectGame` chamava `launchAll`),
+   * com `confirmJoinOnline` como único freio — que só entra com a conta
+   * online. Games/Recent já têm a própria ação "Join Game" desde o P1, então
+   * o card virou um duplicado do lançar. Agora o card leva para os
+   * servidores, igual ao ícone "Browse servers" e ao `ServerListDialog`.
+   */
+  it("leva aos servidores em vez de lançar ao clicar no card de um jogo (Games)", async () => {
+    setInvokeHandler((cmd) => {
+      if (cmd === "search_games") {
+        return {
+          sorts: [
+            { games: [{ rootPlaceId: 606849621, universeId: 1, name: "Jailbreak", playerCount: 10 }] },
+          ],
+        };
+      }
+      if (cmd === "start_server_scan") return 5;
+      return undefined;
+    });
+    const store = setStore({
+      accounts: [ACCOUNT_A],
+      selectedIds: new Set([1001]),
+      selectedAccounts: [ACCOUNT_A],
+    });
+    render(<ChooseGameScreen />);
+
+    await userEvent.click(screen.getByRole("button", { name: "Games" }));
+    await userEvent.click(await screen.findByText("Jailbreak"));
+
+    expect(store.setPlaceId).toHaveBeenCalledWith("606849621");
+    expect(await screen.findByLabelText("Place ID")).toBeInTheDocument();
+    expect(store.joinServer).not.toHaveBeenCalled();
+    expect(store.launchMultiple).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Decisão: como Recent só grava num launch bem-sucedido (store.tsx) e o
+   * card não lança mais nada, gravamos aqui manualmente — a mesma saída que
+   * o `ServerListDialog` já usa — senão o jogo clicado desaparecia da lista.
+   */
+  it("grava o jogo em Recent mesmo sem lançar, ao clicar no card", async () => {
+    setInvokeHandler((cmd) => {
+      if (cmd === "search_games") {
+        return {
+          sorts: [
+            { games: [{ rootPlaceId: 606849621, universeId: 1, name: "Jailbreak", playerCount: 10 }] },
+          ],
+        };
+      }
+      if (cmd === "start_server_scan") return 6;
+      return undefined;
+    });
+    setStore({
+      accounts: [ACCOUNT_A],
+      selectedIds: new Set([1001]),
+      selectedAccounts: [ACCOUNT_A],
+    });
+    render(<ChooseGameScreen />);
+
+    await userEvent.click(screen.getByRole("button", { name: "Games" }));
+    await userEvent.click(await screen.findByText("Jailbreak"));
+
+    await waitFor(() => {
+      const recent = JSON.parse(localStorage.getItem("ram_recent_games") || "[]");
+      expect(recent.some((g: { placeId: number }) => g.placeId === 606849621)).toBe(true);
+    });
+  });
+});
+
+/**
+ * Descoberta: toda lista de jogos leva aos servidores daquele jogo, a dica de
+ * cada aba diz o que a aba faz, e a grade de janelas não divide espaço com o
+ * log de lançamento.
+ */
+describe("ChooseGameScreen — descoberta", () => {
+  function renderScreen(overrides: Partial<StoreValue> = {}) {
+    const store = setStore({
+      accounts: [ACCOUNT_A],
+      selectedIds: new Set([1001]),
+      selectedAccounts: [ACCOUNT_A],
+      ...overrides,
+    });
+    render(<ChooseGameScreen />);
+    return store;
+  }
+
+  function seedFavorite() {
+    localStorage.setItem(
+      "ram_favorite_games",
+      JSON.stringify([
+        { placeId: 606849621, name: "Jailbreak", iconUrl: null, addedAt: 0, vipServers: [] },
+      ])
+    );
+  }
+
+  function seedRecent() {
+    localStorage.setItem(
+      "ram_recent_games",
+      JSON.stringify([
+        { placeId: 920587237, name: "Adopt Me", iconUrl: null, lastPlayed: Date.now() },
+      ])
+    );
+  }
+
+  /** Item do dono: ver servidores de um favorito exigia pesquisar na aba Games. */
+  it("abre os servidores de um jogo favorito", async () => {
+    setInvokeHandler((cmd) => (cmd === "start_server_scan" ? 7 : undefined));
+    seedFavorite();
+    const store = renderScreen();
+
+    await userEvent.click(await screen.findByRole("button", { name: "Browse servers" }));
+
+    expect(store.setPlaceId).toHaveBeenCalledWith("606849621");
+    expect(await screen.findByLabelText("Place ID")).toBeInTheDocument();
+    expect(store.joinServer).not.toHaveBeenCalled();
+  });
+
+  it("abre os servidores de um jogo recente", async () => {
+    setInvokeHandler((cmd) => (cmd === "start_server_scan" ? 8 : undefined));
+    seedRecent();
+    const store = renderScreen();
+
+    await userEvent.click(screen.getByRole("button", { name: "Recent" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Browse servers" }));
+
+    expect(store.setPlaceId).toHaveBeenCalledWith("920587237");
+    expect(await screen.findByLabelText("Place ID")).toBeInTheDocument();
+    expect(store.joinServer).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Item do dono: "Right click no jogo > Auto Rejoin deve abrir a tela já
+   * configurada com aquele jogo, sem copiar e colar o Place ID". O place vai
+   * **explícito** na abertura porque o rascunho salvo vence a store.
+   */
+  it("abre o Botting Mode pelo menu do jogo favorito, já com o jogo", async () => {
+    seedFavorite();
+    const store = renderScreen();
+
+    fireEvent.contextMenu(await screen.findByText("Jailbreak"), { clientX: 5, clientY: 5 });
+    const menu = within(await screen.findByTestId("favorite-context-menu"));
+    await userEvent.click(menu.getByRole("button", { name: "Auto Rejoin" }));
+
+    expect(store.openBottingDialog).toHaveBeenCalledWith("606849621");
+    expect(store.setPlaceId).toHaveBeenCalledWith("606849621");
+    // Escolher o jogo para o Auto Rejoin não lança nada.
+    expect(store.joinServer).not.toHaveBeenCalled();
+    expect(store.launchMultiple).not.toHaveBeenCalled();
+  });
+
+  it("abre os Scripts pelo menu do jogo recente, já com o jogo", async () => {
+    seedRecent();
+    const store = renderScreen();
+
+    await userEvent.click(screen.getByRole("button", { name: "Recent" }));
+    fireEvent.contextMenu(await screen.findByText("Adopt Me"), { clientX: 5, clientY: 5 });
+    const menu = within(await screen.findByTestId("game-context-menu"));
+    await userEvent.click(menu.getByRole("button", { name: "Scripts" }));
+
+    expect(store.setScriptsOpen).toHaveBeenCalledWith(true);
+    expect(store.setPlaceId).toHaveBeenCalledWith("920587237");
+    expect(store.joinServer).not.toHaveBeenCalled();
+  });
+
+  /** A aba do Join link era a única sem dica: ninguém sabia o que havia nela. */
+  it("explica a aba Follow na dica", async () => {
+    renderScreen();
+
+    await userEvent.click(screen.getByRole("button", { name: "Follow" }));
+
+    expect(screen.getByText(/Paste any Roblox link/i)).toBeInTheDocument();
+  });
+
+  /** Quem colou link no campo de Job ID precisa de um caminho curto até lá. */
+  it("leva da aba Servers ao Join link em um clique", async () => {
+    setInvokeHandler((cmd) => (cmd === "start_server_scan" ? 9 : undefined));
+    renderScreen();
+
+    await userEvent.click(screen.getByRole("button", { name: "Servers" }));
+    await userEvent.click(screen.getByRole("button", { name: /Paste a join link/i }));
+
+    expect(screen.getByPlaceholderText(/ExperienceInvite/)).toBeInTheDocument();
+  });
+
+  /**
+   * Console e Windows viraram a página Console da barra lateral (pedido do
+   * dono, 11/10/2026): a Choose Game fica só com as formas de escolher o jogo.
+   */
+  it("keeps only the ways to pick a game in its tabs", () => {
+    renderScreen();
+    const tabs = within(document.querySelector("[data-tour='cg-tabs']") as HTMLElement)
+      .getAllByRole("button")
+      .map((b) => b.textContent);
+    expect(tabs).toEqual(["Favorites", "Games", "Recent", "Servers", "Friends", "Follow"]);
+    expect(screen.queryByTestId("session-panel")).not.toBeInTheDocument();
+  });
+
+  it("the resolved join link leads to the Session page", async () => {
+    setInvokeHandler((cmd) => (cmd === "resolve_join_link" ? joinTarget({ kind: "place" }) : undefined));
+    const store = renderScreen();
+    await userEvent.click(screen.getByRole("button", { name: "Follow" }));
+    await userEvent.type(screen.getByPlaceholderText(/ExperienceInvite/), "https://www.roblox.com/games/606849621");
+    await userEvent.click(screen.getByRole("button", { name: "Join" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Open Session" }));
+    expect(store.setActivePage).toHaveBeenCalledWith("session");
+  });
+});
+
+describe("ChooseGameScreen — chips das contas", () => {
+  it("tira a conta do lote pelo x do chip", async () => {
+    const store = setStore({
+      accounts: [ACCOUNT_A, ACCOUNT_B],
+      selectedIds: new Set([1001, 1002]),
+      selectedAccounts: [ACCOUNT_A, ACCOUNT_B],
+    });
+    render(<ChooseGameScreen />);
+
+    await userEvent.click(screen.getByRole("button", { name: /Remove alpha from this launch/i }));
+    expect(store.setSelectedIds).toHaveBeenCalledWith(new Set([1002]));
+  });
+
+  /** Um lote vazio deixaria a tela sem nada para lançar. */
+  it("não deixa remover a última conta", async () => {
+    const store = setStore({
+      accounts: [ACCOUNT_A],
+      selectedIds: new Set([1001]),
+      selectedAccounts: [ACCOUNT_A],
+    });
+    render(<ChooseGameScreen />);
+
+    const remove = screen.getByRole("button", { name: /Remove alpha from this launch/i });
+    expect(remove).toBeDisabled();
+    await userEvent.click(remove);
+    expect(store.setSelectedIds).not.toHaveBeenCalled();
+  });
+
+  /** O nome já saía mascarado; a foto da conta continuava no chip. */
+  it("com nomes ocultos o chip não mostra nome nem foto", () => {
+    setStore({
+      accounts: [ACCOUNT_A, ACCOUNT_B],
+      selectedIds: new Set([1001, 1002]),
+      selectedAccounts: [ACCOUNT_A, ACCOUNT_B],
+      hideUsernames: true,
+      hiddenNameLetters: 0,
+      showAvatarsWhenHidden: false,
+      avatarUrls: new Map([[1001, "https://avatar.test/1001.png"]]),
+    });
+    render(<ChooseGameScreen />);
+    expect(screen.getAllByRole("button", { name: /Remove \*{12} from this launch/i })).toHaveLength(2);
+    expect(document.body.innerHTML).not.toContain("avatar.test");
+    expect(screen.queryByText("alpha")).not.toBeInTheDocument();
+  });
+});
+
+describe("ChooseGameScreen — shell", () => {
+  it("closes on Back and on Escape", async () => {
+    const store = setStore({
+      accounts: [ACCOUNT_A],
+      selectedIds: new Set([1001]),
+      selectedAccounts: [ACCOUNT_A],
+    });
+    render(<ChooseGameScreen />);
+
+    await userEvent.click(screen.getByRole("button", { name: /Back/ }));
+    expect(store.setChooseGameOpen).toHaveBeenCalledWith(false);
+
+    await userEvent.keyboard("{Escape}");
+    expect(store.setChooseGameOpen).toHaveBeenCalledTimes(2);
+  });
+
+  it("summarises how many accounts will launch", async () => {
+    setStore({
+      accounts: [ACCOUNT_A, ACCOUNT_B],
+      selectedIds: new Set([1001, 1002]),
+      selectedAccounts: [ACCOUNT_A, ACCOUNT_B],
+    });
+    render(<ChooseGameScreen />);
+    expect(screen.getByText("2 accounts will be launched together")).toBeInTheDocument();
+    expect(screen.getByText("alpha")).toBeInTheDocument();
+    expect(screen.getByText("bravo")).toBeInTheDocument();
+  });
+});
+
+/**
+ * Tutorial da Choose Game: passa pelas abas (Games, Servers, Friends,
+ * Windows) só abrindo cada uma — nenhuma conta é lançada no caminho.
+ */
+describe("ChooseGameScreen — tutorial", () => {
+  function renderScreen() {
+    setInvokeHandler((cmd) => {
+      switch (cmd) {
+        case "search_games":
+          return { sorts: [{ games: [] }] };
+        case "list_display_monitors":
+          return [{ index: 0, width: 1920, height: 1080, primary: true }];
+        default:
+          return undefined;
+      }
+    });
+    const store = setStore({
+      accounts: [ACCOUNT_A, ACCOUNT_B],
+      selectedIds: new Set([1001, 1002]),
+      selectedAccounts: [ACCOUNT_A, ACCOUNT_B],
+    });
+    render(<ChooseGameScreen />);
+    return store;
+  }
+
+  it("walks every tab of the Choose Game tutorial without launching anyone", async () => {
+    const store = renderScreen();
+    await walkTour("choose-game", { invoke: invokeMock });
+    expect(store.joinServer).not.toHaveBeenCalled();
+    expect(store.launchMultiple).not.toHaveBeenCalled();
+    expect(store.setChooseGameOpen).not.toHaveBeenCalled();
+  });
+
+  it("Escape closes the tutorial, not the screen behind it", async () => {
+    const store = renderScreen();
+    render(<ScreenTourHost />);
+    await userEvent.click(screen.getByRole("button", { name: /Tutorial/ }));
+    await userEvent.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(store.setChooseGameOpen).not.toHaveBeenCalled();
+  });
+});

@@ -1,0 +1,110 @@
+# Escolha de servidor (preferência e região)
+
+## Objetivo
+
+Decidir **em qual servidor público** o lote entra, em vez de deixar o Roblox escolher: aleatório, o mais vazio ou o mais cheio — opcionalmente exigindo um país (o caso concreto: garantir servidor brasileiro) — e permitir escolher o servidor na mão, vendo a lista.
+
+## Onde fica o código
+
+| Peça | Arquivo |
+|---|---|
+| Preferência e ranking | [api/roblox/server_pick.rs](../../src-tauri/src/api/roblox/server_pick.rs) (`ServerPreference`, `rank_servers`, `pick_server`) |
+| Região do servidor | [api/roblox/server_regions.rs](../../src-tauri/src/api/roblox/server_regions.rs) (`resolve_server_region`, `lookup_ip_region`, `format_region`) |
+| Comandos Tauri | [commands/account_api.rs](../../src-tauri/src/commands/account_api.rs) (`pick_server`, `list_servers_ranked`, `start_server_scan`, `stop_server_scan`, `get_server_regions`) |
+| Aba Servers (Choose Game) | [components/servers/ServersTab.tsx](../../src/components/servers/ServersTab.tsx) |
+| Navegador de servidores (diálogo) | [components/server-list/ServersTab.tsx](../../src/components/server-list/ServersTab.tsx) |
+| Estado/persistência | [store.tsx](../../src/store.tsx) → `General.ServerPreference`, `General.ServerRegionFilter` |
+| Evento | `server-region-progress` → `{ done, total }` |
+| Suíte de teste | `bun run t servers` |
+
+## Fluxo
+
+### Preferência no launch
+
+> **Não vale na entrada rápida** (desde 15/10/2026, pedido do dono): o "Join Game" de Favorites, Games e Recent não usa a preferência nem o país. Uma conta entra direto (o Roblox escolhe o servidor, na hora — era a demora do clique); várias contas usam só o `bestfit` sem país, para caírem juntas. A preferência abaixo segue valendo para os outros caminhos sem servidor escolhido. Ver [ui-layout.md](ui-layout.md).
+
+1. O usuário escolhe a preferência na aba **Servers** da Choose Game e, se quiser, um país.
+
+   | Preferência | O que escolhe |
+   |---|---|
+   | **Best fit** (padrão) | O mais cheio que ainda caiba o lote **com uma vaga de folga** |
+   | Fullest | O mais cheio com vaga para o lote |
+   | Emptiest | O mais vazio |
+   | Random | Qualquer um com vaga |
+   | Let Roblox choose | Não escolhe: Job ID vazio (comportamento antigo) |
+2. Ao lançar **sem** servidor escolhido, `launchAll` chama `pick_server` **uma vez** para o lote.
+3. O backend pede a lista com o `sortOrder` da preferência (`Asc` = menos jogadores, `Desc` = mais — confirmado contra a API) e `excludeFullGames=true`, descarta quem não cabe o lote, e devolve o Job ID.
+4. No **Best fit** ele desce as páginas de `Desc` (até 6) até achar a faixa que cabe o lote: num jogo popular a primeira página é toda de servidores com uma ou duas vagas, e cair no `Asc` traria os vazios, que é justamente o que não se quer.
+4. Todas as contas entram naquele Job ID pelo `launch_multiple`.
+
+### Região
+
+1. A lista de servidores **não** traz região. Para cada servidor: `join-game-instance` → endereço do servidor → geolocalização (`ipwho.is`, com `ip-api.com` de reserva).
+   - **O endereço é o público do UDMUX.** Quase todo servidor fica atrás do proxy UDMUX do Roblox: o `joinScript.MachineAddress` é o IP **interno** da máquina (`10.x`) e o público vem em `joinScript.UdmuxEndpoints[].Address` — o cliente registra os dois (`UDMUX Address = 128.116.86.33 … | RCC Server Address = 10.33.5.69`). Até 14/10/2026 o app geolocalizava o `MachineAddress` e a coluna Region mostrava o IP interno em todos os servidores (confirmado nos logs reais do dono). Hoje `join_script_address` prefere o primeiro endereço público do UDMUX, depois o `MachineAddress` se for público.
+   - **IP privado/reservado nunca é geolocalizado** (`is_public_ip`: 10/8, 172.16/12, 192.168/16, CGNAT, loopback, link-local, documentação, IPv6 local). Sem endereço público, a região fica desconhecida (o rótulo vira o IP) e a entrada continua permitida — o join aceitou.
+2. Na aba Servers isso só acontece quando o usuário clica **Check servers** ("Verificar servidores"; antes "Load regions"), em lotes de 10.
+   - **Permissão vem junto.** O `join-game-instance` é um pedido de entrada, e a resposta já diz se a conta da consulta (a primeira selecionada) pode entrar: `status` 12 é o "Unauthorized" do Roblox — o erro 524, *You do not have permission to join this experience* — e vira `denied` no `ServerRegion` ([server_regions.rs](../../src-tauri/src/api/roblox/server_regions.rs)). A linha mostra **Sem permissão** (com a conta e a mensagem do Roblox no title). É pelo código, não pelo texto (a mensagem vem no idioma da conta); servidor cheio (`status` 6) não conta.
+   - **Conta por conta.** A permissão costuma ser do **place** (regra de acesso do jogo, teleporte, VC), não do servidor. Então, depois das regiões, as outras contas selecionadas perguntam **uma vez cada** (`check_place_access`, com a mesma pausa), no servidor que respondeu pela primeira, e a tela mostra *Acesso neste place:* com cada conta (pode entrar / sem permissão / não deu para verificar) — mais um aviso quando nenhuma entra. O acesso é reiniciado a cada nova varredura (o place pode ter mudado).
+   - **O Entrar continua ativo.** A recusa é a resposta para uma conta; desativar o botão impedia o dono de testar com as outras (relato de 28/09/2026: sub-places do Life Sentence que não aceitam entrada direta, e as alts descobrindo o 524 tentando entrar).
+   - **Na página Session, a região vem do log** (desde 15/10/2026), sem chamada nenhuma à API do Roblox: o monitor de saúde lê a linha `UDMUX Address = <ip>` de cada join do cliente e pede a região desse IP ao mesmo `lookup_ip_region` (cache em memória e no `ServerRegionCache.json`; só IP público — o interno nem vira evento). Até 2 consultas novas por passada, em segundo plano; falha espera 10 min para perguntar de novo. O rótulo usa o `General.ServerRegionFormat`. Ver [history.md](history.md#região-e-tempo-no-ar-do-servidor).
+3. Com filtro de país no launch, `pick_server` percorre os candidatos **na ordem da preferência** e para no primeiro que bate.
+
+## Varredura da lista (aba Servers)
+
+Um jogo grande tem milhares de servidores e a API devolve 100 por página; com um lote de 6 contas, as primeiras páginas podem não ter **nenhum** servidor que caiba todo mundo. Por isso a aba não espera o fim: `start_server_scan` percorre as páginas em background (250 ms entre elas) e publica um evento `server-scan` a cada página, já com a lista reordenada. A varredura para quando acha 12 servidores que cabem o lote, quando as páginas acabam, quando bate o limite de páginas, ou quando o usuário troca de jogo/ordem (`stop_server_scan`).
+
+**Quantas páginas** vem do campo *Pages to scan* (padrão 30 = 3000 servidores), guardado em `General.ServerScanPages`. O backend aplica um teto absoluto de 500 páginas: uma varredura sem fim martelaria a API do Roblox. Quando a varredura para **por causa do limite** (e não por falta de servidores), o evento traz `stoppedAtLimit` e a aba oferece dobrar o número em vez de dizer que acabou.
+
+**Sem nenhum servidor que caiba o lote**, a ordem deixa de ser a preferência e passa a ser **quantas contas cabem** — mais vagas primeiro, e entre iguais o mais cheio. Antes a lista abria com os de uma vaga só e os que levavam quatro contas ficavam escondidos lá embaixo.
+
+A aba **reordena a lista recebida** antes de desenhar (`rankRows`), com o número de contas que está selecionado naquele momento: cabe com folga → cabe justo → não cabe (mais vagas primeiro). O backend já manda ordenado, mas quem tem certeza do tamanho do lote é a tela, e é ela que escreve os rótulos ("3 free · needs 6") — as duas coisas precisam concordar. Pelo mesmo motivo, o recorte dos 150 servidores enviados por evento coloca os que cabem o lote **antes** do corte.
+
+Os eventos são aceitos pelo **maior `scanId` já visto**, não pelo id que o `start_server_scan` devolveu: duas varreduras seguidas resolvem o `invoke` fora de ordem, e comparar com o id "atual" podia descartar os eventos da varredura nova e deixar na tela a primeira página da antiga.
+
+### Voltar à aba (cache da varredura)
+
+A última varredura **terminada** de cada combinação place + ordem + tamanho do lote + páginas fica num cache de memória da sessão (`serversCache` em [ServersTab.tsx](../../src/components/servers/ServersTab.tsx), via `utils/sessionCache.ts`), junto com as regiões e o acesso das contas já verificados. Ao voltar para a aba (ou para a Choose Game), a lista aparece no primeiro desenho, com *Updating...* ao lado do Refresh, e uma varredura nova roda **por trás**:
+
+- as páginas parciais da varredura nova **não** substituem a lista guardada — só a varredura terminada (`done`) troca a lista; uma página no lugar de uma varredura completa seria um passo para trás;
+- a região de um servidor que continua listado é mantida (custou uma chamada de join); a de quem saiu da lista vai junto;
+- erro na varredura de fundo mantém a lista anterior, com o erro em cima;
+- varredura que não terminou (a aba saiu no meio) não é guardada;
+- o **Refresh** manual e a troca de place/ordem/páginas sem cache continuam recomeçando do zero, como antes.
+
+Não há requisição a mais: a volta à aba já disparava uma varredura nova.
+
+### Servidor repetido entre páginas
+
+A lista do Roblox se mexe entre uma requisição e outra (jogador entra, jogador sai), então **o mesmo Job ID volta em páginas diferentes** — em dados reais de um jogo grande, 50 repetidos em 400 servidores, 33 deles só entre a primeira e a segunda página.
+
+A varredura junta as páginas **deduplicando por Job ID** (`extend_unique`), e a aba faz o mesmo antes de desenhar (`dedupeRows`). Sem isso:
+
+- a contagem de "servidores examinados" mentia;
+- e, pior, cada repetido virava uma **chave de lista duplicada** no React, que então parava de reordenar a tabela — a lista subia os servidores bons e travava no meio do caminho, que foi o sintoma relatado (o DOM chegava a ter 183 linhas para uma lista de 150).
+
+## Regras de negócio
+
+- **Um servidor por lote, não um por conta.** O `shuffleJob` antigo sorteia dentro do laço de cada conta, o que espalha o lote; a preferência resolve antes e manda todo mundo para o mesmo Job ID.
+- **O servidor tem que caber o lote inteiro** (`playing + contas <= maxPlayers`). Se nenhum couber, usa os que têm alguma vaga — travar o launch seria pior.
+- **O Best fit deixa uma vaga de folga** (`FREE_SEAT_BUFFER`): entrar num servidor que fica lotado no instante seguinte impede qualquer um de entrar depois, inclusive uma conta que caiu e voltou. O teto (`maxPlayers - contas - 1`) **nunca é negativo**, e a folga é preferência, não regra: sem nenhum servidor com folga, vale o que couber.
+- **Job ID explícito, VIP e Follow vencem a preferência**: ela só entra quando o usuário não escolheu servidor.
+- **Falhar ao escolher não cancela o launch**: sem servidor resolvido o lote segue com Job vazio (comportamento antigo), com um toast explicando.
+- **Sem servidor no país pedido, a UI pergunta.** O backend devolve o melhor disponível com `regionFallback: true`; entrar calado no país errado é exatamente o que o usuário quer evitar.
+- **Região é cara**: uma chamada de `join-game-instance` por servidor, com pausa de ~0,9 s e teto de 40 por pedido. Nunca é resolvida automaticamente ao abrir a lista.
+- **Cada IP é geolocalizado uma vez.** O cache fica em memória e em `ServerRegionCache.json` na pasta de dados — é cache descartável, fora de `DATA_FILES`, então não entra em backup nem em migração.
+- Na lista, servidor **sem região resolvida continua visível** mesmo com filtro ligado: escondê-lo faria parecer que não existe servidor naquele país.
+
+## Configurações relacionadas
+
+| Chave (`RAMSettings.ini`, seção `General`) | O quê |
+|---|---|
+| `ServerPreference` | `bestfit` (padrão) \| `fullest` \| `emptiest` \| `random` \| `none`. O valor antigo `default` é lido como `bestfit`. |
+| `ServerRegionFilter` | Código do país exigido (`BR`); vazio = sem filtro |
+| `ServerRegionFormat` | Template do rótulo: `<city>`, `<region>`, `<country>`, `<countryCode>`, `<ip>` |
+
+## Armadilhas / cuidados
+
+- O `join-game-instance` é o **mesmo** endpoint que o cliente usa para entrar no jogo. Resolver região em rajada toma 429 e marca a conta — a pausa e o teto existem por isso.
+- A ordem tem que ser pedida à **API**, não refeita na página carregada: a resposta traz no máximo 100 servidores e um jogo grande tem milhares, então reordenar localmente mostra "o mais cheio entre os mais vazios" (foi o bug de a aba exibir 3/13 em tudo com "Fullest"). O backend ainda reordena o que recebeu, porque paginação e cache do Roblox já devolveram páginas fora de ordem.
+- O serviço de geolocalização pode cair (o `ipapi.co` que o app usava antes passou a exigir desafio do Cloudflare e a coluna Region parou de funcionar). Por isso há reserva e, na pior hipótese, o rótulo vira o IP cru em vez de "erro".
+- Os Job IDs mudam a cada refresh da lista; as regiões resolvidas são descartadas junto.

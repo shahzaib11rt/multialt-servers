@@ -1,0 +1,139 @@
+[English](README.md) | **Português**
+
+# MultiAlt — Roblox Account Manager
+![MultiAlt: escolha um jogo e entre com todas as contas selecionadas](site/assets/screens/choose-game.png)
+
+<p align="center">
+  <a href="https://multialt.pages.dev/get/readme/"><img src="Images/download-button-pt.svg" alt="Baixar para Windows (instalador .msi)" width="420"></a>
+  <br>
+  <sub>Windows 10/11 · <a href="https://multialt.pages.dev/pt/">🌐 site</a> · <a href="https://www.youtube.com/@MultiAltApp">▶ YouTube</a> · <a href="https://discord.gg/NPvyWgKbfH">💬 Discord</a></sub>
+</p>
+
+[![Total Downloads](https://img.shields.io/github/downloads/luanmacea/MultiAlt/total?label=Total%20Downloads&color=2ea043)](https://github.com/luanmacea/MultiAlt/releases) [![Latest Release Downloads](https://img.shields.io/github/downloads/luanmacea/MultiAlt/latest/total?label=Latest%20Release%20Downloads&color=1f6feb)](https://github.com/luanmacea/MultiAlt/releases/latest) [![Latest Release](https://img.shields.io/github/v/release/luanmacea/MultiAlt?include_prereleases&label=Latest%20Release&color=e36209)](https://github.com/luanmacea/MultiAlt/releases/latest) [![GitHub stars](https://img.shields.io/github/stars/luanmacea/MultiAlt?style=social)](https://github.com/luanmacea/MultiAlt/stargazers)
+
+**⭐ Curtiu o MultiAlt? [Dê uma estrela no repositório](https://github.com/luanmacea/MultiAlt)** (no canto de cima desta página). Ele é grátis e feito por uma pessoa só, e cada estrela faz mais gente encontrar o app e mantém as atualizações vindo.
+
+**O gerenciador de várias contas Roblox feito para a melhor experiência de uso.** Todas as suas contas Roblox num lugar só, quantos clientes do Roblox você quiser abertos ao mesmo tempo e suas alts sem nunca precisar deslogar — com Auto Rejoin, anti-AFK, busca de servidor, entrada no servidor de amigos, contas criptografadas e muito mais.
+
+Rápido e leve: reescrito do zero em **Rust + TypeScript** com [Tauri](https://tauri.app/). Não precisa instalar .NET nem VC++.
+
+*O MultiAlt se chamava **RAM — Roblox Account Manager** até a v0.1.8: o mesmo app, os mesmos dados, e ele se atualiza sozinho para o nome novo.*
+
+Todo o crédito a [ic3w0lf22](https://github.com/ic3w0lf22), que criou o Roblox Account Manager original, e a [niccdevs](https://github.com/niccdevs), que o manteve depois. Este projeto continua o trabalho deles: o Roblox Account Manager original foi [arquivado em outubro de 2024](https://github.com/ic3w0lf22/Roblox-Account-Manager), e o MultiAlt é o sucessor mantido. Vindo do RAM? **Add → Import Old Account Data** traz as suas contas.
+
+Achou um bug ou tem uma ideia? Abra uma [issue](https://github.com/luanmacea/MultiAlt/issues) ou fale com a gente no [Discord](https://discord.gg/NPvyWgKbfH).
+
+# ⚠️ Aviso
+Nunca gere um "rbx-player link" a pedido de terceiros — quem tiver esse link pode entrar em qualquer jogo (ou até no Roblox Studio) com a sua conta, gastar seu Robux ou fazer você ser banido.
+
+# Download
+**[⬇ Baixar o instalador (.msi)](https://github.com/luanmacea/MultiAlt/releases/latest/download/MultiAlt-Setup.msi)** — é só isso que a maioria precisa. Sai 0/75 no VirusTotal, instala só para o seu usuário (**sem pedir administrador**) e se atualiza sozinho.
+
+Baixe só deste repositório. Os arquivos `zz-…sig` da [página da release](https://github.com/luanmacea/MultiAlt/releases/latest) são da atualização automática: não precisa baixá-los.
+
+> Procurando o `.exe` portátil? Ele não está sendo publicado por enquanto (um antivírus o marcou 1/75); o `.msi` também não pede administrador.
+
+> Instalou pelo antigo `-setup.exe`? Ele não é mais publicado, então não se atualiza mais. Desinstale em Configurações do Windows → Aplicativos e instale o `.msi` uma vez — suas contas e configurações continuam.
+
+# Funcionalidades
+
+### Contas
+| Funcionalidade | O que faz |
+| :--- | :--- |
+| Várias formas de adicionar | Login pelo navegador, cookie, `usuario:senha`, `usuario:senha:cookie`, arrastar um cookie para a lista, ou importar o `AccountData.json` do RAM antigo |
+| Criador de contas | Cria contas de graça no navegador embutido: o app preenche nome, senha, data e gênero, você só resolve o CAPTCHA. Prefixo de nome para o lote inteiro |
+| Contas criptografadas | As contas ficam sempre criptografadas no disco — com a sua senha, ou com uma chave do aparelho se você não definir uma. "Lembrar senha" opcional |
+| Grupos e ordem | Arrastar e soltar, grupos, ordem manual que sobrevive a fechar o app, alias de até 240 caracteres, descrição, campos livres |
+| Status ao vivo | Quem está online, em jogo ou no Studio, qual sessão expirou e quais contas estão paradas há 20+ dias |
+| Utilitários da conta | Display name, privacidade, trocar senha/e-mail, PIN, encerrar outras sessões, bloqueios, outfits, avatar por JSON, código do Quick Login |
+| Make Friends | Faz todas as contas virarem amigas entre si (mesh) ou de uma conta (star), com intervalo configurável |
+| Modo streamer | Esconde os nomes de usuário na lista para gravar ou fazer live |
+| Backups | Cria, lista e restaura backups de contas, settings, scripts e temas de dentro do app |
+
+### Jogar
+| Funcionalidade | O que faz |
+| :--- | :--- |
+| Multi Roblox | Quantos clientes do Roblox você quiser ao mesmo tempo |
+| Multi Launch | Lança uma seleção inteira de contas no mesmo jogo ou servidor, uma por vez — a próxima pode começar assim que a anterior entra no jogo, em vez de esperar um tempo fixo |
+| Busca de servidor | Varre os servidores do jogo e escolhe o melhor para o seu grupo: *Best fit* (o mais cheio em que todos ainda cabem), mais cheio, mais vazio ou aleatório. Filtro de região e checagem de "sem permissão" |
+| Links de entrada | Cole qualquer link — jogo, servidor privado/VIP, link de compartilhamento, convite, deep link — e todos entram |
+| Amigos | Amigos online de cada conta e o grupo inteiro no servidor de um amigo. Seguir um jogador pelo nome |
+| Favoritos e recentes | Jogos salvos com vários links VIP cada; jogos e servidores recentes |
+| Versões do Roblox | Instala builds do Roblox lado a lado e escolhe qual abrir. Acha instalações do Bloxstrap, Fishstrap e Voidstrap |
+| Grade de janelas | Organiza todas as janelas do Roblox em grade nos monitores escolhidos |
+| Painel de sessão | Fila de launch (cancelável), clientes abertos (focar, fechar), **por que uma conta caiu** (perdeu a conexão, foi expulsa — com a mensagem do Roblox —, o jogo fechou sozinho ou o servidor foi desligado) e um console ao vivo explicando cada launch, rejoin e ação do Watcher |
+| Janelas com nome | Cada janela do Roblox leva o nome da conta ("conta - Roblox"), para distinguir na barra de tarefas |
+
+### Automação
+| Funcionalidade | O que faz |
+| :--- | :--- |
+| Reconexão automática | A conta que cai volta sozinha para o mesmo jogo — e o mesmo servidor privado. Liga para todas as contas ou por conta |
+| Auto Rejoin | Mantém suas alts num servidor: a cada N minutos cada alt é fechada e relançada, e as contas main ficam abertas e nunca são reiniciadas |
+| AFK mode (anti-AFK) | Manda uma tecla **ou um clique** para a janela de cada conta a cada poucos minutos para ninguém ser kickado por inatividade — sem rejoin, sem perder progresso. Ponto do clique marcado uma vez para todas ou por conta |
+| Watcher | Avisa quando uma janela do Roblox para de responder, e fecha o cliente que perdeu a conexão, ficou sem memória ou mudou de título (detecção de beta) |
+| PC acordado | O PC não entra em suspensão enquanto o Modo AFK, o Auto Rejoin ou a reconexão automática estão rodando |
+| Otimização | Limite de FPS, gráficos, tamanho de janela, prioridade do processo, EcoQoS, limites de CPU/memória e FastFlags — um perfil para jogar normal e perfis separados para mains e alts do Auto Rejoin |
+| Isolamento pré-launch | Limpa cache, rastros no registro, MachineGuid e MAC antes de cada launch para uma conta não herdar a sessão da outra (Windows, só com nenhum cliente aberto) |
+| Scripts | Automação em JavaScript dentro do gerenciador (isolada, com permissões por script) pela API `ram.*` |
+| API Web local / Nexus | API HTTP local e servidor WebSocket para ferramentas externas e o `Nexus.lua` (não vem no instalador padrão) |
+
+### App
+| Funcionalidade | O que faz |
+| :--- | :--- |
+| Atualização automática | Procura versões novas e se atualiza sozinho |
+| Temas | Editor de tema embutido: cores, estilo de botão e fontes, com presets exportáveis |
+| Idiomas | Inglês, português e espanhol (alemão parcial) |
+| Modo de vídeo seguro | Se a janela abrir em branco, o app se recupera sozinho (ou segure **Shift** ao abrir) |
+
+# FAQ
+
+**Por que é detectado como vírus?**
+O app não tem assinatura de código, e ferramentas que abrem processos de jogo são falso positivo comum nos modelos de aprendizado de máquina dos antivírus. Toda release é escaneada no VirusTotal e no Windows Defender, e o `.msi` sai limpo. O código é público (Rust + Tauri) — você pode auditar e compilar você mesmo. Baixe só das releases oficiais do GitHub.
+
+**Como ativo o Multi Roblox?**
+Settings → `General` → `Multi Roblox` (com o Roblox fechado).
+
+**Por que o Multi Roblox vem desativado?**
+A Byfron já declarou que múltiplos clientes podem ser vistos como comportamento suspeito — ative por sua conta e risco.
+
+**Posso ser banido por usar isso?**
+Não viola os Termos de Serviço do Roblox, mas alguns jogos proíbem alts — confira as regras do jogo antes.
+
+**Como faço backup das minhas contas?**
+Pelo app: Settings → `Backups` ([detalhes](docs/features/backups.md)). O zip leva o `AccountData.key` junto — sem ele o backup não restaura —, então, **sem senha no app, quem tiver o zip consegue abrir as contas**. Se você guarda backup em nuvem, ponha senha antes (Settings → `Privacy & security` → `Change Encryption Method` → `Open` → `Pass Lock`).
+
+**O app abriu com a janela em branco (ou preta). E agora?**
+A interface é desenhada pelo Microsoft Edge WebView2 Runtime, então reinstalar o app não resolve. O app tenta se recuperar sozinho: se a interface não aparecer em 25 s, ele reabre com a aceleração de vídeo desligada. Para forçar esse modo, **segure Shift** enquanto o app abre (ou acrescente `--safe-mode` ao campo *Destino* do atalho). Se continuar em branco, repare o **Microsoft Edge WebView2 Runtime** em Configurações do Windows → Aplicativos → Aplicativos instalados → Modificar → Reparar, reinicie o Windows e atualize o driver de vídeo. [Detalhes](docs/features/webview-recovery.md).
+
+**Como saio do modo de vídeo seguro?**
+Uma faixa amarela no topo do app tem o botão **Voltar ao modo normal**. Se ela não aparecer, apague o arquivo `webview.safemode` que fica junto do `RAMSettings.ini` (por padrão em `%LOCALAPPDATA%\Roblox Account Manager`) e abra o app de novo.
+
+**Funciona no Mac?**
+Ainda não — o suporte a macOS é parcial.
+
+# Versão 0.x (Beta)
+Em desenvolvimento ativo: as versões 0.x vão até a primeira versão completamente corrigida, que será a 1.0.0. Espere bugs e mudanças de comportamento entre elas.
+
+# Desenvolvimento
+
+```bash
+bun install              # dependências do frontend
+bun run tauri dev        # roda o app em modo dev (hot reload)
+bun run tauri build      # build de produção (instalador)
+bun run check            # typecheck + todos os testes (vitest + cargo test)
+```
+
+O primeiro `tauri dev`/`tauri build` compila todas as crates Rust do zero e pode levar alguns minutos; os seguintes são incrementais. A documentação de desenvolvimento fica em [docs/](docs/README.md).
+
+# Preview
+Fotos reais, com os nomes das contas ocultos (o app tem um botão para isso). Clique numa para ver em tamanho real.
+
+<table>
+  <tr><td width="50%"><a href="site/assets/screens/accounts.png"><img src="site/assets/screens/accounts.png" alt="Contas"></a><br><sub><b>Contas</b></sub></td><td width="50%"><a href="site/assets/screens/choose-game.png"><img src="site/assets/screens/choose-game.png" alt="Escolher jogo"></a><br><sub><b>Escolher jogo</b></sub></td></tr>
+  <tr><td width="50%"><a href="site/assets/screens/session.png"><img src="site/assets/screens/session.png" alt="Sessão"></a><br><sub><b>Sessão</b></sub></td><td width="50%"><a href="site/assets/screens/afk-clicks.png"><img src="site/assets/screens/afk-clicks.png" alt="Cliques AFK"></a><br><sub><b>Cliques AFK</b></sub></td></tr>
+  <tr><td width="50%"><a href="site/assets/screens/auto-rejoin.png"><img src="site/assets/screens/auto-rejoin.png" alt="Auto Rejoin"></a><br><sub><b>Auto Rejoin</b></sub></td><td width="50%"><a href="site/assets/screens/avatars.png"><img src="site/assets/screens/avatars.png" alt="Avatares"></a><br><sub><b>Avatares</b></sub></td></tr>
+  <tr><td width="50%"><a href="site/assets/screens/theme.png"><img src="site/assets/screens/theme.png" alt="Tema"></a><br><sub><b>Tema</b></sub></td><td width="50%"><a href="site/assets/screens/settings.png"><img src="site/assets/screens/settings.png" alt="Configurações"></a><br><sub><b>Configurações</b></sub></td></tr>
+</table>
+
+# Apoie o projeto
+O MultiAlt é grátis, de código aberto e mantido por uma pessoa só. O jeito mais fácil de ajudar: **[⭐ dar uma estrela no repositório](https://github.com/luanmacea/MultiAlt)**, contar para um amigo que joga com alts e mandar bugs ou ideias nas [issues](https://github.com/luanmacea/MultiAlt/issues) ou no [Discord](https://discord.gg/NPvyWgKbfH).

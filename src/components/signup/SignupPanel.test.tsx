@@ -1,0 +1,386 @@
+import "@testing-library/jest-dom/vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { cleanup, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+
+vi.mock("../../store", async () => (await import("../../test-utils/renderWithStore")).storeModuleMock());
+vi.mock("@tauri-apps/api/core", async () => (await import("../../test-utils/tauriMocks")).tauriCoreMock());
+vi.mock("@tauri-apps/api/event", async () => (await import("../../test-utils/tauriMocks")).tauriEventMock());
+
+import { SignupPanel, phaseLabel } from "./SignupPanel";
+import { renderWithStore } from "../../test-utils/renderWithStore";
+import {
+  emitTauriEvent,
+  invokeMock,
+  resetTauriMocks,
+  setInvokeMap,
+} from "../../test-utils/tauriMocks";
+import type { SignupIdentity, SignupStatus } from "../../types";
+
+function identity(overrides: Partial<SignupIdentity> = {}): SignupIdentity {
+  return {
+    username: "Swift_Falcon412",
+    password: "Rabcdefghijk7",
+    day: "07",
+    month: "Mar",
+    year: "2001",
+    gender: "male",
+    ...overrides,
+  };
+}
+
+function status(overrides: Partial<SignupStatus> = {}): SignupStatus {
+  return {
+    active: false,
+    current: 0,
+    total: 0,
+    created: 0,
+    phase: "idle",
+    identity: null,
+    lastError: null,
+    createdUsernames: [],
+    ...overrides,
+  };
+}
+
+function callsFor(cmd: string) {
+  return invokeMock.mock.calls.filter((call) => call[0] === cmd);
+}
+
+beforeEach(() => {
+  resetTauriMocks();
+  setInvokeMap({ get_signup_status: status() });
+});
+
+afterEach(cleanup);
+
+describe("SignupPanel — rótulos de fase", () => {
+  const t = (s: string) => s;
+
+  it("traduz cada fase do backend", () => {
+    expect(phaseLabel("opening", t)).toMatch(/Opening/);
+    expect(phaseLabel("filling", t)).toMatch(/Filling/);
+    expect(phaseLabel("waiting-user", t)).toMatch(/CAPTCHA/);
+    expect(phaseLabel("saving", t)).toMatch(/Saving/);
+    expect(phaseLabel("done", t)).toMatch(/Finished/);
+    expect(phaseLabel("error", t)).toMatch(/Error/);
+    expect(phaseLabel("qualquer-coisa", t)).toMatch(/Idle/);
+  });
+});
+
+describe("SignupPanel — sessão", () => {
+  it("começa a sessão com a quantidade pedida", async () => {
+    const user = userEvent.setup();
+    setInvokeMap({
+      get_signup_status: status(),
+      start_signup_session: status({ active: true, total: 5, phase: "opening" }),
+    });
+    renderWithStore(<SignupPanel />);
+
+    await user.click(await screen.findByRole("button", { name: "Start" }));
+
+    await waitFor(() => expect(callsFor("start_signup_session")).toHaveLength(1));
+    expect(callsFor("start_signup_session")[0][1]).toMatchObject({ count: 5 });
+  });
+
+  /**
+   * O dono quer padronizar o nome das contas de um lote: digita "arvore" e
+   * elas saem "arvore_k3p9z". O prefixo fica guardado porque é padrão dele, não
+   * escolha de uma vez só.
+   */
+  it("grava o prefixo do nome ao sair do campo", async () => {
+    const user = userEvent.setup();
+    setInvokeMap({ get_signup_status: status(), get_all_settings: {}, update_setting: null });
+    renderWithStore(<SignupPanel />);
+
+    const campo = await screen.findByLabelText("Name prefix (optional)");
+    await user.type(campo, "arvore");
+    await user.tab();
+
+    await waitFor(() =>
+      expect(callsFor("update_setting")).toContainEqual([
+        "update_setting",
+        { section: "Generator", key: "SignupUsernamePrefix", value: "arvore" },
+      ])
+    );
+  });
+
+  /**
+   * Pedido do Discord (30/10/2026): uma senha só para o lote. Ela vai para a
+   * sessão e não para o RAMSettings.ini; curta demais nem começa.
+   */
+  it("manda a senha escolhida para a sessão sem gravá-la nas configurações", async () => {
+    const user = userEvent.setup();
+    setInvokeMap({
+      get_signup_status: status(),
+      get_all_settings: {},
+      update_setting: null,
+      start_signup_session: status({ active: true, total: 5, phase: "opening" }),
+    });
+    const { store } = renderWithStore(<SignupPanel />);
+    const campo = await screen.findByLabelText("Password for every account (optional)");
+
+    await user.type(campo, "curta");
+    await user.click(screen.getByRole("button", { name: "Start" }));
+    expect(store.addToast).toHaveBeenCalledWith("The password needs at least 8 characters.");
+    expect(callsFor("start_signup_session")).toHaveLength(0);
+
+    await user.type(campo, "Senha123");
+    await user.click(screen.getByRole("button", { name: "Start" }));
+    await waitFor(() => expect(callsFor("start_signup_session")).toHaveLength(1));
+    expect(callsFor("start_signup_session")[0][1]).toMatchObject({ count: 5, password: "curtaSenha123" });
+    expect(JSON.stringify(callsFor("update_setting"))).not.toContain("curtaSenha123");
+  });
+
+  it("sem senha escolhida, cada conta continua com a sorteada", async () => {
+    const user = userEvent.setup();
+    setInvokeMap({
+      get_signup_status: status(),
+      get_all_settings: {},
+      update_setting: null,
+      start_signup_session: status({ active: true, total: 5, phase: "opening" }),
+    });
+    renderWithStore(<SignupPanel />);
+    await user.click(await screen.findByRole("button", { name: "Start" }));
+    await waitFor(() => expect(callsFor("start_signup_session")).toHaveLength(1));
+    expect(callsFor("start_signup_session")[0][1]).toMatchObject({ password: null });
+  });
+
+  /** "let us choose the name or put like 1-100": nomes em ordem, com prefixo. */
+  it("numera os nomes só com prefixo e grava a escolha", async () => {
+    const user = userEvent.setup();
+    setInvokeMap({
+      get_signup_status: status(),
+      get_all_settings: { Generator: { SignupUsernameNext: "7" } },
+      update_setting: null,
+    });
+    renderWithStore(<SignupPanel />);
+    const caixa = await screen.findByRole("checkbox", { name: /Number the names in order/ });
+    expect(caixa).toBeDisabled();
+
+    await user.type(screen.getByLabelText("Name prefix (optional)"), "arvore");
+    expect(caixa).toBeEnabled();
+    expect(screen.getByText("(arvore_7 instead of random characters)")).toBeInTheDocument();
+    await user.click(caixa);
+    await waitFor(() =>
+      expect(callsFor("update_setting")).toContainEqual([
+        "update_setting",
+        { section: "Generator", key: "SignupUsernameNumbered", value: "true" },
+      ])
+    );
+    expect(screen.getByText("Next number")).toBeInTheDocument();
+  });
+
+  it("abre com o prefixo que já estava salvo", async () => {
+    setInvokeMap({
+      get_signup_status: status(),
+      get_all_settings: { Generator: { SignupUsernamePrefix: "arvore" } },
+    });
+    renderWithStore(<SignupPanel />);
+
+    await waitFor(() =>
+      expect(screen.getByLabelText("Name prefix (optional)")).toHaveValue("arvore")
+    );
+  });
+
+  it("recusa na digitação o que o Roblox não aceita no nome", async () => {
+    const user = userEvent.setup();
+    setInvokeMap({ get_signup_status: status(), get_all_settings: {}, update_setting: null });
+    renderWithStore(<SignupPanel />);
+
+    const campo = await screen.findByLabelText("Name prefix (optional)");
+    // O underscore do separador já gasta o único que o Roblox permite.
+    await user.type(campo, "min_ha 2!");
+
+    expect(campo).toHaveValue("minha2");
+  });
+
+  it("lê o estado inicial, porque a sessão pode já estar rodando", async () => {
+    setInvokeMap({
+      get_signup_status: status({ active: true, total: 3, created: 1, phase: "waiting-user" }),
+    });
+    renderWithStore(<SignupPanel />);
+
+    expect(await screen.findByRole("button", { name: "Stop" })).toBeInTheDocument();
+    expect(screen.getByText("1 of 3 created")).toBeInTheDocument();
+  });
+
+  it("acompanha o evento de progresso", async () => {
+    renderWithStore(<SignupPanel />);
+    await screen.findByRole("button", { name: "Start" });
+
+    emitTauriEvent("signup-progress", status({ active: true, total: 2, phase: "filling" }));
+
+    expect(await screen.findByText("Filling the form")).toBeInTheDocument();
+  });
+
+  it("para a sessão pelo backend", async () => {
+    const user = userEvent.setup();
+    setInvokeMap({ get_signup_status: status({ active: true, total: 2, phase: "waiting-user" }) });
+    renderWithStore(<SignupPanel />);
+
+    await user.click(await screen.findByRole("button", { name: "Stop" }));
+    await waitFor(() => expect(callsFor("stop_signup_session")).toHaveLength(1));
+  });
+});
+
+/**
+ * `Login.PersistentProfile` e `Login.StealthMode` sao exatamente o que reduz o
+ * CAPTCHA aqui, mas moram em Settings › Accounts. Quem apanha do CAPTCHA esta
+ * nesta tela: ela tem que apontar para os ajustes (sem duplicar os toggles).
+ */
+describe("SignupPanel — ajustes que reduzem CAPTCHA", () => {
+  it("aponta para os ajustes de login que reduzem o CAPTCHA", async () => {
+    renderWithStore(<SignupPanel />);
+
+    const hint = await screen.findByText(/Keep browser data between uses/);
+    expect(hint).toHaveTextContent("Reduce automation signals");
+    expect(hint).toHaveTextContent("Settings");
+  });
+
+  it("leva direto para os ajustes quando o diálogo oferece o atalho", async () => {
+    const user = userEvent.setup();
+    const openLoginSettings = vi.fn();
+    renderWithStore(<SignupPanel onOpenLoginSettings={openLoginSettings} />);
+
+    await user.click(await screen.findByRole("button", { name: "Open login settings" }));
+    expect(openLoginSettings).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("SignupPanel — identidade gerada", () => {
+  /**
+   * A senha gerada só existe aqui: se ela não aparecer, a conta fica presa ao
+   * cookie e o usuário nunca mais entra nela pelo site.
+   */
+  it("mostra usuário, senha e data de nascimento da conta em criação", async () => {
+    setInvokeMap({
+      get_signup_status: status({
+        active: true,
+        total: 1,
+        phase: "waiting-user",
+        identity: identity(),
+      }),
+    });
+    renderWithStore(<SignupPanel />);
+
+    expect(await screen.findByText("Swift_Falcon412")).toBeInTheDocument();
+    expect(screen.getByText("Rabcdefghijk7")).toBeInTheDocument();
+    expect(screen.getByText("07/Mar/2001")).toBeInTheDocument();
+  });
+
+  /** Desde 14/10/2026 o app clica em "Cadastrar-se" sozinho; o CAPTCHA é da pessoa. */
+  it("avisa que o app clica em Criar conta e que o CAPTCHA é com o usuário", async () => {
+    setInvokeMap({
+      get_signup_status: status({ active: true, total: 1, phase: "waiting-user", identity: identity() }),
+      get_all_settings: {},
+    });
+    renderWithStore(<SignupPanel />);
+
+    expect(
+      await screen.findByText(/presses Create Account by itself\. If Roblox shows a CAPTCHA, solve it/i)
+    ).toBeInTheDocument();
+  });
+
+  it("com a opção desligada, pede para a pessoa clicar em Criar conta", async () => {
+    setInvokeMap({
+      get_signup_status: status({ active: true, total: 1, phase: "waiting-user", identity: identity() }),
+      get_all_settings: { Generator: { SignupAutoSubmit: "false" } },
+    });
+    renderWithStore(<SignupPanel />);
+
+    expect(await screen.findByText(/Solve the CAPTCHA in the browser window and press Create Account/i)).toBeInTheDocument();
+  });
+
+  it("clicar em Criar conta sozinho vem ligado e desligar fica salvo", async () => {
+    const user = userEvent.setup();
+    setInvokeMap({ get_signup_status: status(), get_all_settings: {}, update_setting: null });
+    renderWithStore(<SignupPanel />);
+
+    const opcao = await screen.findByRole("checkbox", { name: /Press Create Account by itself/ });
+    expect(opcao).toBeChecked();
+    await user.click(opcao);
+    await waitFor(() =>
+      expect(callsFor("update_setting")).toContainEqual([
+        "update_setting",
+        { section: "Generator", key: "SignupAutoSubmit", value: "false" },
+      ])
+    );
+    expect(opcao).not.toBeChecked();
+  });
+
+  it("copia usuário e senha", async () => {
+    const write = vi.fn().mockResolvedValue(undefined);
+    // `userEvent.setup()` instala a própria área de transferência; o dublê tem
+    // que vir depois dela.
+    const user = userEvent.setup();
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText: write },
+      configurable: true,
+    });
+    setInvokeMap({
+      get_signup_status: status({ active: true, total: 1, phase: "waiting-user", identity: identity() }),
+    });
+    renderWithStore(<SignupPanel />);
+
+    await user.click(await screen.findByRole("button", { name: /Copy/i }));
+    expect(write).toHaveBeenCalledWith("Swift_Falcon412\tRabcdefghijk7");
+  });
+
+  it("lista as contas já criadas e mostra o erro da última tentativa", async () => {
+    setInvokeMap({
+      get_signup_status: status({
+        active: false,
+        total: 3,
+        created: 2,
+        phase: "done",
+        createdUsernames: ["Swift_Falcon412", "Brave_Otter88"],
+        lastError: "Tempo esgotado esperando a conclusão do cadastro",
+      }),
+    });
+    renderWithStore(<SignupPanel />);
+
+    expect(await screen.findByText("Swift_Falcon412")).toBeInTheDocument();
+    expect(screen.getByText("Brave_Otter88")).toBeInTheDocument();
+    expect(screen.getByText(/Tempo esgotado/)).toBeInTheDocument();
+    expect(screen.getByText("2 of 3 created")).toBeInTheDocument();
+  });
+
+  it("mostra o erro do backend ao tentar começar", async () => {
+    const user = userEvent.setup();
+    setInvokeMap({ get_signup_status: status() });
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "get_signup_status") return status();
+      if (cmd === "start_signup_session") throw new Error("Já existe uma criação de contas em andamento");
+      return undefined;
+    });
+    const { store } = renderWithStore(<SignupPanel />);
+
+    await user.click(await screen.findByRole("button", { name: "Start" }));
+    await waitFor(() => expect(store.addToast).toHaveBeenCalled());
+  });
+});
+
+/**
+ * As duas funcoes de criar conta tinham quatro nomes na interface. A gratis se
+ * chama `Create Accounts` no menu Add, no AddAccountDialog e no GeneratorDialog;
+ * aqui ela ainda se apresentava como "Create accounts in the browser".
+ */
+describe("SignupPanel — nome da funcao", () => {
+  it("uses the same name the rest of the app gives this function", async () => {
+    setInvokeMap({ get_signup_status: status() });
+    renderWithStore(<SignupPanel />);
+
+    expect(await screen.findByText("Create Accounts")).toBeInTheDocument();
+    expect(screen.queryByText("Create accounts in the browser")).not.toBeInTheDocument();
+  });
+
+  it("says it is the free one, like every other entry point does", async () => {
+    setInvokeMap({ get_signup_status: status() });
+    renderWithStore(<SignupPanel />);
+
+    expect(
+      await screen.findByText("Free — the app fills Roblox's signup form; you solve the CAPTCHA")
+    ).toBeInTheDocument();
+  });
+});

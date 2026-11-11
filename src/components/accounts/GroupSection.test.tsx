@@ -1,0 +1,320 @@
+import "@testing-library/jest-dom/vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+
+vi.mock("../../store", async () => (await import("../../test-utils/renderWithStore")).storeModuleMock());
+vi.mock("@tauri-apps/api/core", async () => (await import("../../test-utils/tauriMocks")).tauriCoreMock());
+vi.mock("../../hooks/usePrompt", async () => (await import("../../test-utils/promptMocks")).promptModuleMock());
+
+import { GroupSection } from "./GroupSection";
+import { AccountChip } from "./AccountChip";
+import { defaultSettings, groupAccounts, makeAccount, setStore } from "../../test-utils/renderWithStore";
+import type { StoreValue } from "../../store";
+import { confirmMock, promptAnswers, promptMock, resetPromptMocks } from "../../test-utils/promptMocks";
+
+const ACCOUNTS = [
+  makeAccount({ UserID: 11, Username: "ann", Group: "Alts" }),
+  makeAccount({ UserID: 12, Username: "bob", Group: "Alts" }),
+];
+const GROUP = groupAccounts(ACCOUNTS)[0];
+
+function renderGroup(overrides: Partial<StoreValue> = {}, props: Partial<Parameters<typeof GroupSection>[0]> = {}) {
+  const store = setStore({ accounts: ACCOUNTS, ...overrides });
+  const onToggle = vi.fn();
+  const onDrop = vi.fn();
+  render(
+    <GroupSection group={GROUP} collapsed={false} onToggle={onToggle} onDrop={onDrop} {...props} />
+  );
+  return { store, onToggle, onDrop };
+}
+
+function header(): HTMLElement {
+  const el = document.querySelector("[data-group-header='true']");
+  if (!el) throw new Error("group header not rendered");
+  return el as HTMLElement;
+}
+
+/**
+ * A checkbox do grupo é procurada pelo papel, não pela posição no DOM: a busca
+ * por `firstElementChild` quebrava a cada elemento novo no cabeçalho (foi o que
+ * aconteceu quando ele ganhou o punho de arrastar).
+ */
+function groupCheckbox(): HTMLElement {
+  return within(header()).getByRole("checkbox");
+}
+
+afterEach(cleanup);
+
+describe("GroupSection", () => {
+  it("shows the group name, member count and its rows", () => {
+    renderGroup();
+    expect(screen.getByText("Alts")).toBeInTheDocument();
+    expect(screen.getByText("2")).toBeInTheDocument();
+    expect(screen.getByText("ann")).toBeInTheDocument();
+    expect(screen.getByText("bob")).toBeInTheDocument();
+  });
+
+  /**
+   * Visão em cards (General.AccountListView=cards, pedido do dono em
+   * 14/10/2026): a mesma conta, com o mesmo clique de seleção e o mesmo
+   * `data-account-row` que a seleção por caixa procura.
+   */
+  it("draws the accounts as cards when the list view is cards, and a click still selects", async () => {
+    const settings = defaultSettings();
+    const { store } = renderGroup({ settings: { ...settings, General: { ...settings.General, AccountListView: "cards" } } });
+    const cards = document.querySelectorAll("[data-account-row='true']");
+    expect(cards).toHaveLength(2);
+    expect(cards[0].className).toContain("rounded-xl");
+    await userEvent.click(screen.getByText("ann"));
+    expect(store.handleSelect).toHaveBeenCalledWith(11, expect.anything());
+  });
+
+  it("keeps the rows when the list view was never set", () => {
+    renderGroup();
+    const rows = document.querySelectorAll("[data-account-row='true']");
+    expect(rows).toHaveLength(2);
+    expect(rows[0].className).not.toContain("rounded-xl");
+  });
+
+  it("toggles the group when the header is clicked", async () => {
+    const { onToggle } = renderGroup();
+    await userEvent.click(header());
+    expect(onToggle).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports the group key when something is dropped on the header", () => {
+    const { onDrop } = renderGroup();
+    fireEvent.drop(header(), { dataTransfer: { getData: () => "" } });
+    expect(onDrop).toHaveBeenCalledWith("Alts");
+  });
+
+  /**
+   * Arrastar conta por conta para ordenar era inviável; reordenar **grupos** é o
+   * que dá para fazer. O arrasto começa num punho, não no cabeçalho inteiro:
+   * o cabeçalho também é alvo de drop de conta e botão de colapsar.
+   */
+  describe("reordenar grupos", () => {
+    function punho(): HTMLElement {
+      return screen.getByTitle("Drag to reorder groups");
+    }
+
+    it("começa o arrasto do grupo pelo punho e limpa ao terminar", () => {
+      const { store } = renderGroup();
+
+      fireEvent.dragStart(punho(), { dataTransfer: { setData: () => {}, effectAllowed: "" } });
+      expect(store.setGroupDragState).toHaveBeenCalledWith({ groupKey: "Alts" });
+
+      // Arrasto cancelado (Esc, soltar fora) não pode deixar estado velho.
+      fireEvent.dragEnd(punho());
+      expect(store.setGroupDragState).toHaveBeenLastCalledWith(null);
+    });
+
+    it("clicar no punho não colapsa o grupo", async () => {
+      const { onToggle } = renderGroup();
+      await userEvent.click(punho());
+      expect(onToggle).not.toHaveBeenCalled();
+    });
+
+    it("soltar um grupo em outro reordena, e não move conta nenhuma", () => {
+      const { store, onDrop } = renderGroup({ groupDragState: { groupKey: "Mains" } });
+
+      fireEvent.drop(header(), { dataTransfer: { getData: () => "" } });
+
+      expect(store.reorderGroups).toHaveBeenCalledWith("Mains", "Alts");
+      // `onDrop` é o caminho de mover conta para o grupo: não pode disparar aqui.
+      expect(onDrop).not.toHaveBeenCalled();
+      expect(store.setGroupDragState).toHaveBeenCalledWith(null);
+    });
+
+    it("soltar o grupo nele mesmo não faz nada", () => {
+      const { store } = renderGroup({ groupDragState: { groupKey: "Alts" } });
+
+      fireEvent.drop(header(), { dataTransfer: { getData: () => "" } });
+
+      expect(store.reorderGroups).not.toHaveBeenCalled();
+    });
+  });
+
+  /**
+   * Arrastar depende de mouse firme e de o navegador cooperar; o dono pediu um
+   * caminho que sempre funciona. As setas fazem o mesmo `reorderGroups`, uma
+   * posição por clique, e são a única forma de reordenar por teclado.
+   */
+  describe("setas de ordem", () => {
+    const TRES = [
+      makeAccount({ UserID: 11, Username: "ann", Group: "Alts" }),
+      makeAccount({ UserID: 21, Username: "bob", Group: "Mains" }),
+      makeAccount({ UserID: 31, Username: "cid", Group: "Zeta" }),
+    ];
+
+    /** Renderiza o grupo `key` no meio de uma lista de três. */
+    function renderComVizinhos(key: string) {
+      const grupos = groupAccounts(TRES);
+      const grupo = grupos.find((g) => g.key === key)!;
+      const store = setStore({ accounts: TRES, groups: grupos });
+      render(<GroupSection group={grupo} collapsed={false} onToggle={vi.fn()} onDrop={vi.fn()} />);
+      return store;
+    }
+
+    it("sobe o grupo uma posição por clique", async () => {
+      const store = renderComVizinhos("Mains");
+
+      await userEvent.click(screen.getByRole("button", { name: /Move group up/i }));
+
+      // Troca com o vizinho de cima (Alts), não vai para o topo de uma vez.
+      expect(store.reorderGroups).toHaveBeenCalledWith("Mains", "Alts");
+    });
+
+    it("desce o grupo uma posição por clique", async () => {
+      const store = renderComVizinhos("Mains");
+
+      await userEvent.click(screen.getByRole("button", { name: /Move group down/i }));
+
+      expect(store.reorderGroups).toHaveBeenCalledWith("Mains", "Zeta");
+    });
+
+    it("não oferece subir no primeiro nem descer no último", () => {
+      renderComVizinhos("Alts");
+      expect(screen.getByRole("button", { name: /Move group up/i })).toBeDisabled();
+      expect(screen.getByRole("button", { name: /Move group down/i })).toBeEnabled();
+
+      cleanup();
+      renderComVizinhos("Zeta");
+      expect(screen.getByRole("button", { name: /Move group up/i })).toBeEnabled();
+      expect(screen.getByRole("button", { name: /Move group down/i })).toBeDisabled();
+    });
+
+    it("clicar na seta não colapsa o grupo", async () => {
+      const grupos = groupAccounts(TRES);
+      setStore({ accounts: TRES, groups: grupos });
+      const onToggle = vi.fn();
+      render(
+        <GroupSection
+          group={grupos.find((g) => g.key === "Mains")!}
+          collapsed={false}
+          onToggle={onToggle}
+          onDrop={vi.fn()}
+        />
+      );
+
+      await userEvent.click(screen.getByRole("button", { name: /Move group up/i }));
+
+      expect(onToggle).not.toHaveBeenCalled();
+    });
+  });
+
+  it("hides the header when groups are turned off", () => {
+    renderGroup({ showGroups: false });
+    expect(document.querySelector("[data-group-header='true']")).toBeNull();
+    // Rows are still rendered.
+    expect(screen.getByText("ann")).toBeInTheDocument();
+  });
+
+  it("adds every member to the selection from the group checkbox", async () => {
+    const { store } = renderGroup({ selectedIds: new Set([11, 99]) });
+    const checkbox = groupCheckbox();
+    await userEvent.click(checkbox);
+    expect(store.setSelectedIds).toHaveBeenCalledWith(new Set([11, 99, 12]));
+  });
+
+  it("removes every member when the whole group is already selected", async () => {
+    const { store } = renderGroup({ selectedIds: new Set([11, 12, 99]) });
+    const checkbox = groupCheckbox();
+    await userEvent.click(checkbox);
+    expect(store.setSelectedIds).toHaveBeenCalledWith(new Set([99]));
+  });
+
+  /**
+   * Cabeçalho e checkbox eram `<div onClick>`: colapsar o grupo e selecionar
+   * o grupo inteiro não tinham equivalente por teclado.
+   */
+  describe("teclado", () => {
+    it("exposes the header as a button and toggles it with the keyboard", async () => {
+      const { onToggle } = renderGroup();
+      const el = header();
+      expect(el).toHaveAttribute("role", "button");
+      expect(el.tabIndex).toBe(0);
+
+      el.focus();
+      await userEvent.keyboard("{Enter}");
+      expect(onToggle).toHaveBeenCalledTimes(1);
+
+      await userEvent.keyboard(" ");
+      expect(onToggle).toHaveBeenCalledTimes(2);
+    });
+
+    it("exposes the group checkbox with role=checkbox and toggles it with Space", async () => {
+      const { store } = renderGroup({ selectedIds: new Set([11, 99]) });
+      const checkbox = groupCheckbox();
+      expect(checkbox).toHaveAttribute("role", "checkbox");
+      // 11 (do grupo) e 99 (fora) estão selecionados, 12 não: misto, não "false".
+      expect(checkbox).toHaveAttribute("aria-checked", "mixed");
+
+      checkbox.focus();
+      await userEvent.keyboard(" ");
+      expect(store.setSelectedIds).toHaveBeenCalledWith(new Set([11, 99, 12]));
+    });
+
+    it("reports aria-checked=true once the whole group is selected", () => {
+      renderGroup({ selectedIds: new Set([11, 12]) });
+      const checkbox = groupCheckbox();
+      expect(checkbox).toHaveAttribute("aria-checked", "true");
+    });
+
+    it("reports aria-checked=mixed when only part of the group is selected", () => {
+      renderGroup({ selectedIds: new Set([11]) });
+      const checkbox = groupCheckbox();
+      expect(checkbox).toHaveAttribute("aria-checked", "mixed");
+    });
+  });
+});
+
+describe("AccountChip", () => {
+  it("shows the account name and removes it from the selection", async () => {
+    setStore({ accounts: ACCOUNTS });
+    const onRemove = vi.fn();
+    render(<AccountChip account={ACCOUNTS[0]} onRemove={onRemove} />);
+
+    expect(screen.getByText("ann")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button"));
+    expect(onRemove).toHaveBeenCalledTimes(1);
+  });
+
+  it("masks the name when usernames are hidden", () => {
+    setStore({ accounts: ACCOUNTS, hideUsernames: true, hiddenNameLetters: 1 });
+    render(<AccountChip account={ACCOUNTS[0]} onRemove={vi.fn()} />);
+    expect(screen.getByText("a********")).toBeInTheDocument();
+  });
+
+  it("prefers the alias over the username", () => {
+    const aliased = makeAccount({ UserID: 13, Username: "carl", Alias: "Carlito" });
+    setStore({ accounts: [aliased] });
+    render(<AccountChip account={aliased} onRemove={vi.fn()} />);
+    expect(screen.getByText("Carlito")).toBeInTheDocument();
+    expect(screen.queryByText("carl")).not.toBeInTheDocument();
+  });
+});
+
+/** Renomear pelo cabeçalho: o mesmo fluxo do menu de contexto, sem abrir o grupo. */
+describe("GroupSection — rename", () => {
+  afterEach(resetPromptMocks);
+
+  it("renames from the pencil without collapsing the group", async () => {
+    promptAnswers.prompt = "Bots";
+    const { store, onToggle } = renderGroup();
+    await userEvent.click(within(header()).getByRole("button", { name: "Rename group" }));
+    expect(promptMock.mock.calls[0][1]).toBe("Alts");
+    await vi.waitFor(() => expect(store.renameGroup).toHaveBeenCalledWith("Alts", "Bots"));
+    expect(onToggle).not.toHaveBeenCalled();
+    expect(confirmMock).not.toHaveBeenCalled();
+  });
+
+  it("has no pencil on the Default group", () => {
+    const plain = [makeAccount({ UserID: 21, Username: "cy", Group: "" })];
+    const def = groupAccounts(plain)[0];
+    setStore({ accounts: [...ACCOUNTS, ...plain] });
+    render(<GroupSection group={def} collapsed={false} onToggle={vi.fn()} onDrop={vi.fn()} />);
+    expect(screen.queryByRole("button", { name: "Rename group" })).not.toBeInTheDocument();
+  });
+});

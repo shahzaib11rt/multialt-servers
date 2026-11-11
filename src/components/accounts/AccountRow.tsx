@@ -1,0 +1,456 @@
+import { Check, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, User, GripVertical } from "lucide-react";
+import { useStore } from "../../store";
+import { accountInitial, accountLabel, hideAccountAvatar } from "../../utils/accountName";
+import type { Account } from "../../types";
+import { timeAgo, getFreshnessColor, parseAccountDate, AGED_AFTER_DAYS } from "../../types";
+import { Tooltip } from "../ui/Tooltip";
+import { useTr } from "../../i18n/text";
+import { StatusBadge, STATUS_COLORS, type StatusKind } from "./StatusBadge";
+import { moderationBadge, moderationLabel } from "../../utils/moderation";
+import { AccountLiveSegment } from "./AccountLiveSegment";
+
+/**
+ * Uma conta da lista. `variant="card"` é a visão em cards (`AccountListView`,
+ * pedido do dono em 14/10/2026): a mesma conta, com os mesmos cliques, menu,
+ * arrasto e seleção por caixa, só que em pé — foto e nome maiores, numa grade
+ * que ocupa a largura da tela.
+ */
+export function AccountRow({ account, variant = "row" }: { account: Account; variant?: "row" | "card" }) {
+  const t = useTr();
+  const store = useStore();
+  const selected = store.selectedIds.has(account.UserID);
+  const multiMode = store.selectedIds.size > 1;
+  const avatarUrl = store.avatarUrls.get(account.UserID);
+
+  /**
+   * Vizinhos da conta **dentro do grupo dela**. As setas fazem o mesmo
+   * `reorderAccounts` do arrasto, uma posição por clique — o dono pediu um
+   * caminho que não dependa de arrastar, e é também o único que funciona pelo
+   * teclado. Subir a primeira do grupo ficaria fora do grupo, então nas pontas
+   * a seta fica desligada em vez de fazer algo inesperado.
+   */
+  const irmaos = store.accounts.filter(
+    (a) => (a.Group || "Default") === (account.Group || "Default")
+  );
+  const posicao = irmaos.findIndex((a) => a.UserID === account.UserID);
+  const contaAcima = posicao > 0 ? irmaos[posicao - 1] : null;
+  const contaAbaixo =
+    posicao >= 0 && posicao < irmaos.length - 1 ? irmaos[posicao + 1] : null;
+
+  function moverPara(alvo: Account | null, e: React.MouseEvent) {
+    // Sem isto o clique sobe para a linha e seleciona a conta.
+    e.stopPropagation();
+    if (!alvo) return;
+    void store.reorderAccounts(account.UserID, alvo.UserID);
+  }
+  const freshness =
+    store.settings?.General?.DisableAgingAlert === "true"
+      ? null
+      : getFreshnessColor(account.LastUse);
+  const displayName = accountLabel(account, store);
+  const showUsername = !!account.Alias && !store.hideUsernames;
+  const description = account.Description?.trim() || "";
+  const hideAvatar = hideAccountAvatar(store);
+  const showPresence = store.settings?.General?.ShowPresence === "true";
+  // Alias vai ate 240 caracteres (Task 10) e isso estoura a linha; sem esta
+  // opcao o nome continua sendo cortado, que e o comportamento de sempre.
+  //
+  // Ligada, nao basta `break-words`: o nome e item flex, e com `min-width: auto`
+  // ele nunca encolhe abaixo do trecho sem espaco (as quebras de `break-word`
+  // nao contam no tamanho minimo). Um alias como `xXx_Dragon..._2024_xXx`
+  // ficava numa linha so, passando por baixo do carimbo e das setas. `min-w-0`
+  // deixa encolher e `wrap-anywhere` (`overflow-wrap: anywhere`) quebra o
+  // trecho tambem no tamanho minimo.
+  const wrapLongNames = store.settings?.General?.WrapLongNames === "true";
+  const nameOverflowClass = wrapLongNames ? "min-w-0 wrap-anywhere" : "truncate";
+  const presenceType = store.presenceByUserId.get(account.UserID) ?? 0;
+  // Cliente aberto pelo site e reconhecido pelo log também entra no
+  // rastreamento, mas não foi o app que abriu: sem foguete (26/10/2026).
+  const launchedLocally =
+    store.launchedByProgram.has(account.UserID) && !store.adoptedClients.has(account.UserID);
+  const isJoining = store.joiningAccounts.has(account.UserID);
+
+  const presenceMeta =
+    presenceType === 3
+      ? { label: t("In Studio"), dotClass: "bg-violet-500", dotStyle: undefined as React.CSSProperties | undefined }
+      : presenceType >= 2
+      ? { label: t("In Game"), dotClass: "bg-emerald-500", dotStyle: undefined as React.CSSProperties | undefined }
+      : presenceType === 1
+        ? { label: t("Online"), dotClass: "bg-sky-500", dotStyle: undefined as React.CSSProperties | undefined }
+        : { label: t("Offline"), dotClass: "", dotStyle: { backgroundColor: "var(--panel-muted)" } };
+
+  // Conta adicionada por nome de usuário (Quick Add) entra sem cookie, e o
+  // backend ainda a grava com Valid=true — nada na linha a distinguia de uma
+  // conta boa. Quem não tem token não tem sessão: mesma bolinha vermelha de
+  // sessão inválida, com o texto dizendo o que falta fazer.
+  const hasSession = !!account.SecurityToken?.trim();
+
+  const statusDots: Array<{ kind: StatusKind; color: string; title: string }> = [];
+  if (!hasSession) {
+    statusDots.push({
+      kind: "invalid",
+      color: STATUS_COLORS.invalid,
+      title: t("No session — paste its cookie or use Browser Login to sign in"),
+    });
+  } else if (!account.Valid) {
+    statusDots.push({ kind: "invalid", color: STATUS_COLORS.invalid, title: t("Invalid session") });
+  }
+  // A última sessão parou na verificação "confirme que é humano" e ninguém a
+  // resolveu: a próxima abertura vai pedir de novo (pedido do dono, 26/10/2026).
+  if (account.HumanCheckAt) {
+    statusDots.push({
+      kind: "humancheck",
+      color: STATUS_COLORS.humancheck,
+      title: t("Roblox asked for a human check last time and it was not solved. Open the account and solve it in the game window."),
+    });
+  }
+  // Moderação lida do Roblox nesta sessão (painel, "Check accounts" ou antes do
+  // launch). Só aparece quando há algo: conta limpa não ganha selo.
+  const moderation = store.moderationByUserId?.get(account.UserID);
+  const moderationKind = moderationBadge(moderation);
+  if (moderation && moderationKind) {
+    const note = moderation.note?.trim();
+    statusDots.push({
+      kind: moderationKind,
+      color: STATUS_COLORS[moderationKind],
+      title: note
+        ? t("{{status}} — moderator note: {{note}}", { status: moderationLabel(moderation, t), note })
+        : moderationLabel(moderation, t),
+    });
+  }
+  if (freshness) {
+    // A bolinha só dizia "aged"; quem lê precisa saber *de que* envelheceu.
+    // A conta é contada a partir de `LastUse` — a mesma data que a coluna da
+    // direita mostra como "3d"/"2mo" —, e isso não tem relação com a bolinha
+    // vermelha, que é sessão inválida.
+    const agedDays = Math.floor((Date.now() - parseAccountDate(account.LastUse).getTime()) / 86400000);
+    statusDots.push({
+      kind: "aged",
+      color: freshness,
+      title: t(
+        "Aged: {{days}} days since the Last Use date shown on the right ({{threshold}}+ days). Its session may still be fine — a dead session is the red dot.",
+        { days: agedDays, threshold: AGED_AFTER_DAYS }
+      ),
+    });
+  }
+  if (launchedLocally) {
+    statusDots.push({ kind: "launched", color: STATUS_COLORS.launched, title: t("Launched by MultiAlt") });
+  }
+  if (showPresence && presenceType >= 1) {
+    const presenceKind: StatusKind = presenceType === 3 ? "studio" : presenceType >= 2 ? "ingame" : "online";
+    statusDots.push({ kind: presenceKind, color: STATUS_COLORS[presenceKind], title: presenceMeta.label });
+  }
+
+  function handleClick(e: React.MouseEvent) {
+    e.stopPropagation();
+    store.handleSelect(account.UserID, e);
+  }
+
+  function handleContext(e: React.MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!store.selectedIds.has(account.UserID)) {
+      store.selectSingle(account.UserID);
+    }
+    store.openContextMenu(e.clientX, e.clientY);
+  }
+
+  function handleDrop(e: React.DragEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+
+    const dragged = store.dragState;
+    store.setDragState(null);
+    if (!dragged) return;
+
+    if (dragged.sourceGroup === (account.Group || "Default")) {
+      store.reorderAccounts(dragged.userId, account.UserID);
+      return;
+    }
+
+    store.moveToGroup([dragged.userId], account.Group || "Default");
+  }
+
+  const statusBadges =
+    statusDots.length > 0 ? (
+      <div
+        className={`absolute z-10 flex items-center gap-0.5 ${
+          variant === "card" ? "-left-1 -top-1" : "-left-1.5 -top-1"
+        }`}
+      >
+        {statusDots.map((dot, index) => (
+          <Tooltip key={index} content={dot.title} side="bottom">
+            {/* Cor e ícone: o estado não pode depender só da cor (StatusBadge). */}
+            <StatusBadge kind={dot.kind} label={dot.title} color={dot.color} />
+          </Tooltip>
+        ))}
+      </div>
+    ) : null;
+
+  const dragHandleProps = {
+    draggable: true,
+    onDragStart: (e: React.DragEvent) => {
+      e.stopPropagation();
+      e.dataTransfer.effectAllowed = "move";
+      e.dataTransfer.setData("text/plain", String(account.UserID));
+      store.setDragState({ userId: account.UserID, sourceGroup: account.Group || "Default" });
+    },
+    // Cancelled drags (Esc / drop outside) must not leave a stale dragState
+    // that a later cookie-text drop would act on.
+    onDragEnd: () => store.setDragState(null),
+    onClick: (e: React.MouseEvent) => e.stopPropagation(),
+    title: t("Drag to reorder"),
+  };
+
+  const selectBox = (
+    <div
+      className={`w-4 h-4 rounded border flex items-center justify-center transition-all duration-100 ${
+        selected ? "" : "theme-border group-hover/row:brightness-110"
+      }`}
+      style={
+        selected
+          ? { backgroundColor: "var(--accent-color)", borderColor: "var(--accent-color)" }
+          : undefined
+      }
+    >
+      {selected && <Check size={10} stroke="var(--forms-bg)" strokeWidth={3} />}
+    </div>
+  );
+
+  const lastUse = isJoining ? (
+    <span className="inline-flex items-center gap-1 theme-accent">
+      <span className="w-2 h-2 border border-[var(--accent-color)] border-t-transparent rounded-full animate-spin" />
+      <span>{t("Join")}</span>
+    </span>
+  ) : (
+    <span className="theme-muted">{t(timeAgo(account.LastUse))}</span>
+  );
+
+  if (variant === "card") {
+    const arrowClass =
+      "w-6 h-6 flex items-center justify-center rounded theme-muted opacity-0 group-hover/row:opacity-100 focus-visible:opacity-100 hover:text-[var(--panel-fg)] hover:bg-[var(--panel-soft)] disabled:!opacity-0 disabled:cursor-not-allowed transition";
+    return (
+      <div
+        data-account-row="true"
+        data-user-id={account.UserID}
+        className={`@container/row group/row relative flex flex-col items-center gap-1.5 px-2 pt-3 pb-2.5 rounded-xl border cursor-default select-none transition-colors duration-100 ${
+          selected ? "theme-row-selected" : "theme-border theme-row-hover"
+        }`}
+        style={selected ? { borderColor: "var(--accent-color)" } : undefined}
+        onClick={handleClick}
+        onContextMenu={handleContext}
+        onDragOver={(e) => {
+          e.preventDefault();
+          e.dataTransfer.dropEffect = "move";
+        }}
+        onDrop={handleDrop}
+      >
+        {/* Arrasto e caixa de seleção no canto; setas de ordem no outro. */}
+        <div className="absolute left-1.5 top-1.5 flex items-center gap-1">
+          <div
+            {...dragHandleProps}
+            className="opacity-30 group-hover/row:opacity-100 transition-opacity cursor-grab active:cursor-grabbing p-0.5"
+          >
+            <GripVertical size={13} strokeWidth={1.5} className="theme-muted" />
+          </div>
+          {multiMode && selectBox}
+        </div>
+        <div className="absolute right-1 top-1 flex items-center">
+          <button
+            type="button"
+            onClick={(e) => moverPara(contaAcima, e)}
+            disabled={!contaAcima}
+            aria-label={t("Move up")}
+            title={t("Move up")}
+            className={arrowClass}
+          >
+            <ChevronLeft size={13} strokeWidth={2} />
+          </button>
+          <button
+            type="button"
+            onClick={(e) => moverPara(contaAbaixo, e)}
+            disabled={!contaAbaixo}
+            aria-label={t("Move down")}
+            title={t("Move down")}
+            className={arrowClass}
+          >
+            <ChevronRight size={13} strokeWidth={2} />
+          </button>
+        </div>
+
+        <div data-row-marquee-surface="true" className="relative mt-1">
+          {statusBadges}
+          {hideAvatar ? (
+            <div className="theme-avatar w-[72px] h-[72px] rounded-full bg-[var(--panel-soft)] flex items-center justify-center theme-muted">
+              <User size={28} strokeWidth={1.25} />
+            </div>
+          ) : avatarUrl ? (
+            <img
+              src={avatarUrl}
+              alt=""
+              className="theme-avatar w-[72px] h-[72px] rounded-full bg-[var(--panel-soft)] transition-transform duration-150 group-hover/row:scale-105"
+              loading="lazy"
+            />
+          ) : (
+            <div className="theme-avatar w-[72px] h-[72px] rounded-full bg-[var(--panel-soft)] flex items-center justify-center theme-muted text-xl font-medium">
+              {accountInitial(account, store)}
+            </div>
+          )}
+          {showPresence && presenceType >= 1 && (
+            <Tooltip content={presenceMeta.label} side="bottom">
+              <span
+                className={`absolute bottom-0.5 right-0.5 w-3.5 h-3.5 rounded-full border-2 border-[var(--panel-bg)] ${presenceMeta.dotClass}`}
+                style={presenceMeta.dotStyle}
+              />
+            </Tooltip>
+          )}
+        </div>
+
+        <div data-row-marquee-surface="true" className="w-full min-w-0 text-center">
+          <div
+            className={`text-[14px] font-medium leading-tight ${wrapLongNames ? "wrap-anywhere" : "truncate"} ${
+              selected ? "theme-accent" : "text-[var(--panel-fg)]"
+            }`}
+          >
+            {displayName}
+          </div>
+          {showUsername && (
+            <div className={`text-[12px] theme-muted leading-tight ${wrapLongNames ? "wrap-anywhere" : "truncate"}`}>
+              @{account.Username}
+            </div>
+          )}
+          {description && (
+            <Tooltip content={description}>
+              <div className="mt-0.5 text-[11px] theme-muted truncate leading-tight">{description}</div>
+            </Tooltip>
+          )}
+        </div>
+
+        <div className="w-full min-w-0 flex justify-center">
+          <AccountLiveSegment userId={account.UserID} />
+        </div>
+        <div className="text-[11px] tabular-nums">{lastUse}</div>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      data-account-row="true"
+      data-user-id={account.UserID}
+      className={`@container/row group/row theme-row-hover flex items-center gap-3 px-3 py-1.5 cursor-default select-none border-l-2 transition-colors duration-100 ${
+        selected ? "theme-row-selected" : "border-l-transparent"
+      }`}
+      style={selected ? { borderLeftColor: "var(--accent-color)" } : undefined}
+      onClick={handleClick}
+      onContextMenu={handleContext}
+      onDragOver={(e) => {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = "move";
+      }}
+      onDrop={handleDrop}
+    >
+      {/* Drag handle — the reorder drag starts here (not the whole row) so it
+          doesn't conflict with the list's marquee multi-select on the row body. */}
+      <div
+        {...dragHandleProps}
+        className="shrink-0 opacity-30 group-hover/row:opacity-100 transition-opacity cursor-grab active:cursor-grabbing -ml-1 px-0.5 py-1"
+      >
+        <GripVertical size={13} strokeWidth={1.5} className="theme-muted" />
+      </div>
+
+      <div className={`shrink-0 overflow-hidden transition-all duration-150 ease-out ${
+        multiMode ? "w-4 opacity-100" : "w-0 opacity-0"
+      }`}>
+        {selectBox}
+      </div>
+
+      <div className="relative flex-shrink-0">
+        {statusBadges}
+        {hideAvatar ? (
+          <div className="theme-avatar w-8 h-8 rounded-full bg-[var(--panel-soft)] flex items-center justify-center theme-muted">
+            <User size={14} strokeWidth={1.5} />
+          </div>
+        ) : avatarUrl ? (
+          <img
+            src={avatarUrl}
+            alt=""
+            className="theme-avatar w-8 h-8 rounded-full bg-[var(--panel-soft)] transition-transform duration-150 group-hover/row:scale-105"
+            loading="lazy"
+          />
+        ) : (
+          <div className="theme-avatar w-8 h-8 rounded-full bg-[var(--panel-soft)] flex items-center justify-center theme-muted text-xs font-medium">
+            {accountInitial(account, store)}
+          </div>
+        )}
+      </div>
+
+      <div data-row-marquee-surface="true" className="flex-1 min-w-0">
+        <div className="flex items-center gap-1.5 min-w-0">
+          {showPresence && presenceType >= 1 && (
+            <Tooltip content={presenceMeta.label} side="bottom">
+              <span
+                className={`w-1.5 h-1.5 rounded-full shrink-0 ${presenceMeta.dotClass} ${presenceType >= 1 ? "animate-pulse" : ""}`}
+                style={presenceMeta.dotStyle}
+              />
+            </Tooltip>
+          )}
+          <div
+            className={`text-[13px] ${nameOverflowClass} leading-tight transition-colors duration-100 ${
+              selected ? "theme-accent" : "text-[var(--panel-fg)]"
+            }`}
+          >
+            {displayName}
+          </div>
+        </div>
+        {showUsername && (
+          <div className={`text-[12px] theme-muted ${nameOverflowClass} leading-tight`}>
+            @{account.Username}
+          </div>
+        )}
+      </div>
+
+      {/* Estado ao vivo (jogando, caiu, reconectando...) e o jogo; nada com a
+          conta parada. Ver AccountLiveSegment. */}
+      <AccountLiveSegment userId={account.UserID} />
+
+      {description && (
+        <div className="min-w-0 max-w-[38%]">
+          <Tooltip content={description}>
+            <div className="text-[12px] theme-muted truncate leading-tight text-right">
+              {description}
+            </div>
+          </Tooltip>
+        </div>
+      )}
+
+      <div className="text-[12px] w-14 text-right flex-shrink-0 tabular-nums">
+        {lastUse}
+      </div>
+
+      {/* Setas de ordem: o caminho que não depende de arrastar. */}
+      <div className="flex items-center gap-0.5 shrink-0 -mr-1">
+        <button
+          type="button"
+          onClick={(e) => moverPara(contaAcima, e)}
+          disabled={!contaAcima}
+          aria-label={t("Move up")}
+          title={t("Move up")}
+          className="w-6 h-6 flex items-center justify-center rounded theme-muted opacity-60 group-hover/row:opacity-100 focus-visible:opacity-100 hover:text-[var(--panel-fg)] hover:bg-[var(--panel-soft)] disabled:opacity-15 disabled:cursor-not-allowed transition-colors"
+        >
+          <ChevronUp size={13} strokeWidth={2} />
+        </button>
+        <button
+          type="button"
+          onClick={(e) => moverPara(contaAbaixo, e)}
+          disabled={!contaAbaixo}
+          aria-label={t("Move down")}
+          title={t("Move down")}
+          className="w-6 h-6 flex items-center justify-center rounded theme-muted opacity-60 group-hover/row:opacity-100 focus-visible:opacity-100 hover:text-[var(--panel-fg)] hover:bg-[var(--panel-soft)] disabled:opacity-15 disabled:cursor-not-allowed transition-colors"
+        >
+          <ChevronDown size={13} strokeWidth={2} />
+        </button>
+      </div>
+    </div>
+  );
+}

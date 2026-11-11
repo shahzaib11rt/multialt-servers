@@ -1,0 +1,479 @@
+import { describe, expect, it } from "vitest";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+
+/**
+ * O portatil (`MultiAlt_<v>_x64_portable*.exe`) saiu da release em 03/10/2026:
+ * o `.exe` solto leva 1/75 de um motor de ML no VirusTotal, o MSI sai 0/75.
+ * Ele nao foi apagado do workflow — fica atras do interruptor
+ * `PUBLISH_PORTABLE`, para o dono religar trocando uma palavra. Estes testes
+ * garantem as duas metades: o padrao e "false", e nenhum passo publica o
+ * portatil sem consultar o interruptor (senao "desligado" so desligaria metade).
+ */
+const WORKFLOW = path.resolve(__dirname, "..", "workflows", "release-v4.yml");
+const yaml = readFileSync(WORKFLOW, "utf8").replace(/\r\n/g, "\n");
+
+/** Passos do job, pelo `- name:` de cada um. */
+function steps() {
+  const lines = yaml.split("\n");
+  const out = [];
+  let current = null;
+  for (const line of lines) {
+    const m = /^ {6}- name: (.+)$/.exec(line);
+    if (m) {
+      current = { name: m[1].trim(), lines: [] };
+      out.push(current);
+    } else if (current) {
+      current.lines.push(line);
+    }
+  }
+  return out;
+}
+
+const GUARD_IF = "if: env.PUBLISH_PORTABLE == 'true'";
+
+/**
+ * Linhas que ficam dentro de um bloco `{ ... }` aberto por uma linha que casa
+ * com `opener` (PowerShell `if ($env:PUBLISH_PORTABLE -eq "true") {` ou JS
+ * `if (publishPortable) {`), pela indentacao da chave de fechamento.
+ */
+function linesOutsideGuard(lines, opener) {
+  const outside = [];
+  let closeIndent = null;
+  for (const line of lines) {
+    if (closeIndent !== null) {
+      if (line.trim() === "}" || line.trim().startsWith("})")) {
+        const indent = line.length - line.trimStart().length;
+        if (indent === closeIndent) closeIndent = null;
+      }
+      continue;
+    }
+    if (opener.test(line)) {
+      closeIndent = line.length - line.trimStart().length;
+      continue;
+    }
+    outside.push(line);
+  }
+  return outside;
+}
+
+describe("interruptor do portatil no release-v4.yml", () => {
+  it("existe uma vez so e vem desligado", () => {
+    const defs = [...yaml.matchAll(/^\s+PUBLISH_PORTABLE:\s*"?(\w+)"?\s*$/gm)];
+    expect(defs).toHaveLength(1);
+    expect(defs[0][1]).toBe("false");
+  });
+
+  it("todo passo com portable no nome so roda com o interruptor ligado", () => {
+    const portableSteps = steps().filter((s) => /portable/i.test(s.name));
+    expect(portableSteps.length).toBeGreaterThan(0);
+    for (const step of portableSteps) {
+      expect(step.lines.some((l) => l.trim() === GUARD_IF), step.name).toBe(true);
+    }
+  });
+
+  it("nenhum upload do portatil fica fora de um passo protegido", () => {
+    for (const step of steps()) {
+      const uploadsPortable = step.lines.some((l) => /gh release upload/.test(l) && /portable/i.test(l));
+      if (!uploadsPortable) continue;
+      expect(step.lines.some((l) => l.trim() === GUARD_IF), step.name).toBe(true);
+    }
+  });
+
+  it("a copia do portatil para a pasta da release so acontece com o interruptor ligado", () => {
+    const prepare = steps().find((s) => s.name === "Prepare full edition assets and manifest");
+    expect(prepare).toBeDefined();
+    const outside = linesOutsideGuard(prepare.lines, /if \(\$env:PUBLISH_PORTABLE -eq "true"\) \{\s*$/);
+    const leaked = outside.filter((l) => /Copy-Item \$(standard|full)PortableSrc/.test(l) || /Portable binary not found/i.test(l));
+    expect(leaked).toEqual([]);
+    // E o bloco protegido existe de fato (senao o filtro acima passa vazio).
+    expect(prepare.lines.some((l) => /Copy-Item \$standardPortableSrc/.test(l))).toBe(true);
+  });
+
+  it("o guia de download da release so cita o portatil com o interruptor ligado", () => {
+    const finalize = steps().find((s) => s.name === "Finalize release notes");
+    expect(finalize).toBeDefined();
+    expect(finalize.lines.some((l) => /process\.env\.PUBLISH_PORTABLE === "true"/.test(l))).toBe(true);
+    const outside = linesOutsideGuard(finalize.lines, /if \(publishPortable\) \{\s*$/);
+    expect(outside.filter((l) => /portable/i.test(l.replace(/PUBLISH_PORTABLE|publishPortable/g, "")))).toEqual([]);
+  });
+});
+
+/**
+ * O texto da release é lido por gente que não é técnica (pedido do dono,
+ * 03/10/2026): abre com o botão do instalador, sem commit, canal ou conversa
+ * sobre o setup antigo; os outros arquivos ficam num bloco recolhido. Os
+ * títulos "## What's Changed" e "## Contributors" ficam porque o UpdateDialog
+ * do app procura os dois.
+ */
+describe("texto da release", () => {
+  const finalize = () => steps().find((s) => s.name === "Finalize release notes").lines.join("\n");
+
+  it("abre com o download do MSI", () => {
+    const body = finalize();
+    const download = body.indexOf('"## Download"');
+    expect(download).toBeGreaterThan(-1);
+    expect(body).toMatch(/releases\/download\/\$\{tag\}\/MultiAlt-Setup\.msi/);
+    // Os outros arquivos entram depois do download, recolhidos.
+    expect(body.indexOf("...otherFiles")).toBeGreaterThan(download);
+    expect(body).toMatch(/"<details>"/);
+  });
+
+  it("não mostra detalhe técnico nem o setup antigo no topo", () => {
+    const body = finalize();
+    expect(body).not.toMatch(/Release commit|Channel: |App version:|old setup/);
+  });
+
+  it("mantém os títulos que o app usa para montar as notas da atualização", () => {
+    const body = finalize();
+    expect(body).toMatch(/## What's Changed/);
+    expect(body).toMatch(/## Contributors/);
+  });
+});
+
+/**
+ * "What's Changed" em linguagem simples: vem da seção "## What's new" do PR da
+ * release; a lista automática do GitHub (títulos de PR) fica recolhida. Sem a
+ * seção, a lista automática continua sendo o texto (nada sai vazio).
+ */
+describe("o que mudou, em linguagem simples", () => {
+  const finalize = () => steps().find((s) => s.name === "Finalize release notes").lines.join("\n");
+
+  it("lê a seção What's new do PR da release", () => {
+    const body = finalize();
+    expect(body).toMatch(/listPullRequestsAssociatedWithCommit/);
+    expect(body).toMatch(/What's new/);
+  });
+
+  it("guarda a lista técnica recolhida e cai nela quando o PR não tem a seção", () => {
+    const body = finalize();
+    expect(body).toMatch(/<summary>Technical details<\/summary>/);
+    expect(body).toMatch(/: generatedBody \|\| "## What's Changed/);
+    expect(body).toMatch(/^\s+changesBlock,$/m);
+  });
+});
+
+describe("um setup só na release", () => {
+  const body = (name) => steps().find((s) => s.name === name)?.lines.join("\n") ?? "";
+  const names = () => steps().map((s) => s.name);
+
+  it("sobe o MultiAlt-Setup.msi antes de publicar o manifesto do updater", () => {
+    const upload = names().findIndex((n) => /Upload stable-named MSI/.test(n));
+    const manifest = names().indexOf("Generate and push standard update manifest");
+    expect(upload).toBeGreaterThan(-1);
+    expect(upload).toBeLessThan(manifest);
+  });
+
+  it("tira da release a cópia com a versão no nome (o mesmo arquivo)", () => {
+    expect(body("Clean up release assets")).toMatch(/MultiAlt_\*_x64_en-US\.msi|x64_en-US\\.msi/);
+  });
+
+  it("o texto da release não cita mais a cópia com a versão no nome", () => {
+    expect(body("Finalize release notes")).not.toMatch(/the same installer, with the version in the name/);
+  });
+});
+
+/**
+ * A 1.0.0 abriu a série 1.x sem tag anterior, e o bloco de contribuidores saiu
+ * "No contributor metadata found" — também na janela de atualização do app. O
+ * dono do repositório entra sempre (pedido do dono, 03/10/2026).
+ */
+describe("contribuidores da release", () => {
+  it("sempre incluem o dono do repositório, mesmo sem tag anterior", () => {
+    const finalize = steps().find((s) => s.name === "Finalize release notes").lines.join("\n");
+    const add = finalize.indexOf("contributorSet.add(owner)");
+    expect(add).toBeGreaterThan(-1);
+    expect(add).toBeLessThan(finalize.indexOf("if (previousTag) {\n              try {\n                const compare"));
+  });
+});
+
+/**
+ * Tipo da release (correção, novidades, atualização geral — regra em
+ * release-kind.mjs). O tipo decide o bump, então sai do passo "Resolve bump
+ * and channel", antes do "Prepare version and release metadata"; e os dois
+ * textos da release (o inicial, que vai no `notes` do manifesto do updater, e
+ * o final) abrem com a marca e o selo.
+ */
+describe("tipo da release", () => {
+  const step = (name) => steps().find((s) => s.name === name)?.lines.join("\n") ?? "";
+  const names = () => steps().map((s) => s.name);
+
+  it("o passo que resolve o bump decide o tipo pela regra testada, com o texto do PR", () => {
+    const resolve = step("Resolve bump and channel");
+    expect(resolve).toMatch(/listPullRequestsAssociatedWithCommit/);
+    expect(resolve).toMatch(/release-kind\.mjs/);
+    // Windows: import() de caminho absoluto só funciona como file:// URL.
+    expect(resolve).toMatch(/pathToFileURL/);
+    expect(resolve).toMatch(/resolveReleaseControls\(/);
+    expect(resolve).toMatch(/prBody: .*pr\?*\.body/);
+    expect(resolve).toMatch(/core\.setOutput\("kind"/);
+    expect(resolve).toMatch(/core\.setOutput\("bump"/);
+    expect(names().indexOf("Resolve bump and channel")).toBeLessThan(names().indexOf("Prepare version and release metadata"));
+  });
+
+  it("o tipo chega ao prepare-release e ao texto final", () => {
+    expect(step("Prepare version and release metadata")).toMatch(/RELEASE_KIND: \$\{\{ steps\.controls\.outputs\.kind \}\}/);
+    expect(step("Finalize release notes")).toMatch(/RELEASE_KIND: \$\{\{ steps\.controls\.outputs\.kind \}\}/);
+  });
+
+  it("o texto final abre com a marca e o selo, antes do download", () => {
+    const finalize = step("Finalize release notes");
+    expect(finalize).toMatch(/releaseKindHeader\(/);
+    expect(finalize).toMatch(/pathToFileURL/);
+    const final = /const finalBody = \[\s*([\s\S]*?)\]\.join/.exec(finalize);
+    expect(final).not.toBeNull();
+    const parts = final[1].split(",").map((p) => p.trim()).filter(Boolean);
+    expect(parts[0]).toBe("kindHeader");
+    expect(parts.indexOf("topNote")).toBeGreaterThan(0);
+  });
+
+  it("o bump do workflow_dispatch deixa o tipo decidir por padrão", () => {
+    const dispatch = /bump:\n\s+description:.*\n\s+required: false\n\s+default: "(\w+)"/.exec(yaml);
+    expect(dispatch?.[1]).toBe("auto");
+    expect(yaml).toMatch(/- auto\n\s+- patch\n\s+- minor/);
+  });
+
+  it("o título da release não muda (o selo fica no texto)", () => {
+    const prepare = readFileSync(path.resolve(__dirname, "prepare-release.mjs"), "utf8");
+    expect(prepare).toMatch(/const releaseTitle = `MultiAlt \(Roblox Account Manager\) \$\{tag\}`;/);
+  });
+});
+
+/**
+ * O prepare-release.mjs de verdade, numa pasta temporária com um repositório
+ * git de mentira: o texto inicial da release (o que o manifesto do updater
+ * leva como `notes`) abre com a marca e o selo do tipo.
+ */
+describe("prepare-release.mjs", () => {
+  function runPrepare(env) {
+    const dir = mkdtempSync(path.join(tmpdir(), "multialt-prepare-"));
+    try {
+      mkdirSync(path.join(dir, "src-tauri"));
+      writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x", version: "1.0.0" }));
+      writeFileSync(path.join(dir, "src-tauri", "tauri.conf.json"), JSON.stringify({ version: "1.0.0" }));
+      writeFileSync(path.join(dir, "src-tauri", "Cargo.toml"), '[package]\nname = "x"\nversion = "1.0.0"\n');
+      const git = (...args) => execFileSync("git", args, { cwd: dir, stdio: "ignore" });
+      git("init", "-q");
+      git("-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "x");
+      git("tag", "v1.0.0");
+      const output = path.join(dir, "out.txt");
+      writeFileSync(output, "");
+      execFileSync(process.execPath, [path.resolve(__dirname, "prepare-release.mjs")], {
+        cwd: dir,
+        stdio: "pipe",
+        env: { ...process.env, GITHUB_OUTPUT: output, GITHUB_REPOSITORY: "o/r", GITHUB_SHA: "abcdef1234", ...env },
+      });
+      return readFileSync(output, "utf8").replace(/\r\n/g, "\n");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  const bodyOf = (out) => /release_body<<EOF\n([\s\S]*?)\nEOF/.exec(out)?.[1] ?? "";
+
+  it("correção: patch e o selo Hotfix na primeira linha", () => {
+    const out = runPrepare({ RELEASE_BUMP: "patch", RELEASE_KIND: "fix" });
+    expect(out).toMatch(/^version=1\.0\.1-beta$/m);
+    expect(out).toMatch(/^kind=fix$/m);
+    expect(bodyOf(out).startsWith("<!-- release-kind: fix -->\n**🩹 Hotfix**\n\n")).toBe(true);
+  });
+
+  it("novidades: o selo New features", () => {
+    const out = runPrepare({ RELEASE_BUMP: "minor", RELEASE_KIND: "feature" });
+    expect(out).toMatch(/^version=1\.1\.0-beta$/m);
+    expect(bodyOf(out).startsWith("<!-- release-kind: feature -->\n**✨ New features**")).toBe(true);
+  });
+
+  it("recusa tipo desconhecido", () => {
+    expect(() => runPrepare({ RELEASE_BUMP: "patch", RELEASE_KIND: "epic" })).toThrow();
+  });
+});
+
+/**
+ * O contador de downloads da release e o numero de usuarios que o dono olha
+ * (pedido de 05/10/2026). Automacao nenhuma pode baixar o instalador: os
+ * workflows so baixam `.sig` (para reordenar) e o `latest.json`. Conferir o
+ * botao do README e com HEAD (`curl -I`), que nao conta download.
+ */
+describe("automacao nao infla o contador de downloads", () => {
+  const dirs = [
+    path.resolve(__dirname, "..", "workflows"),
+    path.resolve(__dirname),
+  ];
+  const files = dirs.flatMap((dir) =>
+    readdirSync(dir)
+      .filter((f) => /\.(ya?ml|mjs)$/.test(f) && !f.endsWith(".test.mjs"))
+      .map((f) => path.join(dir, f)),
+  );
+
+  it("acha os arquivos de automacao", () => {
+    expect(files.some((f) => f.endsWith("release-v4.yml"))).toBe(true);
+  });
+
+  for (const file of files) {
+    const text = readFileSync(file, "utf8");
+    const name = path.basename(file);
+
+    it(`${name}: gh release download so pega .sig ou latest.json`, () => {
+      const lines = text.split(/\r?\n/).filter((l) => l.includes("gh release download"));
+      for (const line of lines) {
+        expect(line).toMatch(/--pattern\s+"(\$name|latest\.json)"/);
+      }
+      if (lines.some((l) => l.includes('"$name"'))) {
+        // `$name` vem da lista filtrada por "*.sig" logo acima.
+        expect(text).toMatch(/\$sigNames = @\(\$release\.assets \| Where-Object \{ \$_\.name -like "\*\.sig" \}/);
+      }
+    });
+
+    it(`${name}: nenhum curl/wget/Invoke-WebRequest em asset de release`, () => {
+      const fetches = text
+        .split(/\r?\n/)
+        .filter((l) => /\b(curl|wget|Invoke-WebRequest|iwr)\b/.test(l))
+        .filter((l) => /releases\/(latest\/)?download\//.test(l));
+      expect(fetches).toEqual([]);
+    });
+  }
+});
+
+/**
+ * As duas edicoes: a padrao (o `MultiAlt-Setup.msi`) sai sem Nexus e sem Web
+ * Server; a completa liga os dois. Decisao do dono (10/10/2026): a padrao leva
+ * **tudo menos o que faz o scan marca-la** — hoje so Nexus e Web API ficam so na
+ * completa. O que a padrao leva mora na feature `standard` do Cargo.toml, e o
+ * workflow compila `--features standard` sem lista escrita. A distribuicao de
+ * avatares em lote (`avatar-batch`) esta no `standard` desde 08/10/2026; para
+ * tira-la da padrao de novo, e tira-la do `standard` e trocar o
+ * `VITE_ENABLE_AVATAR_BATCH` da padrao (e estes testes) — o cartao "edicao
+ * completa" e a troca de edicao pelo app ja existem.
+ */
+describe("edicoes no release-v4.yml", () => {
+  const stepText = (name) => {
+    const step = steps().find((s) => s.name === name);
+    expect(step, name).toBeDefined();
+    return step.lines.join("\n");
+  };
+
+  const cargoFeatures = () => {
+    const cargo = readFileSync(path.resolve(__dirname, "..", "..", "src-tauri", "Cargo.toml"), "utf8").replace(/\r\n/g, "\n");
+    const section = /\n\[features\]\n([\s\S]*?)\n\[/.exec(cargo)[1];
+    return new Map(
+      [...section.matchAll(/^([\w-]+)\s*=\s*\[([^\]]*)\]/gm)].map((m) => [
+        m[1],
+        [...m[2].matchAll(/"([^"]+)"/g)].map((x) => x[1]),
+      ])
+    );
+  };
+
+  /** Tudo o que uma feature liga, seguindo as features que ela inclui. */
+  const expand = (features, name, seen = new Set()) => {
+    for (const dep of features.get(name) ?? []) {
+      if (seen.has(dep) || !features.has(dep)) continue;
+      seen.add(dep);
+      expand(features, dep, seen);
+    }
+    return seen;
+  };
+
+  it("a padrao compila so a feature standard, sem Nexus e Web Server, com a distribuicao de avatares", () => {
+    const text = stepText("Build and publish standard release");
+    expect(text).toContain("args: -- --no-default-features --features standard");
+    expect(text).not.toMatch(/--features standard,|--features [\w-]+,/);
+    expect(text).toMatch(/VITE_ENABLE_AVATAR_BATCH: "true"/);
+    expect(text).toMatch(/VITE_ENABLE_NEXUS: "false"/);
+    expect(text).toMatch(/VITE_ENABLE_WEBSERVER: "false"/);
+  });
+
+  it("a feature standard do Cargo leva o lote de avatares e deixa Nexus e Web API so na completa", () => {
+    const features = cargoFeatures();
+    expect(features.has("standard")).toBe(true);
+    const standard = expand(features, "standard");
+    expect(standard.has("avatar-batch")).toBe(true);
+    expect(standard.has("nexus")).toBe(false);
+    expect(standard.has("webserver")).toBe(false);
+    expect(standard.has("full")).toBe(false);
+  });
+
+  /**
+   * Decisao do dono (10/10/2026): a completa tem **toda** feature opcional
+   * (nexus, webserver, avatar-batch, live-audio...). A lista mora num lugar so,
+   * o Cargo.toml (`full` = `standard` + o que fica so na completa), e o workflow
+   * compila `--features full` sem lista escrita: feature nova entra no
+   * `standard` ou no `full` e a completa a pega sozinha.
+   */
+  it("a completa compila so a feature full, com toda a UI ligada", () => {
+    const text = stepText("Build full edition (every feature)");
+    expect(text).toContain("bun tauri build -- --features full");
+    expect(text).not.toMatch(/--features full,|--features [\w-]+,/);
+    const flags = (step) => [...step.matchAll(/^\s+(VITE_ENABLE_\w+): "(\w+)"/gm)].map((m) => [m[1], m[2]]);
+    const standardFlags = flags(stepText("Build and publish standard release")).map(([name]) => name);
+    const fullFlags = new Map(flags(text));
+    expect(standardFlags.length).toBeGreaterThan(0);
+    for (const name of standardFlags) {
+      expect(fullFlags.get(name), name).toBe("true");
+    }
+    for (const [name, value] of fullFlags) {
+      expect(value, name).toBe("true");
+    }
+  });
+
+  it("a feature full do Cargo liga toda feature opcional (direto ou via standard), e o default e ela", () => {
+    const features = cargoFeatures();
+    const optional = [...features.keys()].filter((name) => !["default", "full", "standard"].includes(name));
+    expect(optional).toEqual(expect.arrayContaining(["nexus", "webserver", "avatar-batch"]));
+    expect(features.get("full")).toContain("standard");
+    const full = expand(features, "full");
+    full.delete("standard");
+    expect([...full].sort()).toEqual([...optional].sort());
+    expect(features.get("default")).toEqual(["full"]);
+  });
+
+  /**
+   * O canal do updater da completa continua `<canal>-nexus-ws`: e o endereco
+   * que quem ja tem a completa instalada consulta. So o nome do arquivo mudou.
+   */
+  it("o MSI da completa sai como MultiAlt_<v>_Full-Setup.msi, no mesmo canal do updater", () => {
+    const prepare = stepText("Prepare full edition assets and manifest");
+    expect(prepare).toContain('$fullMsiName = "MultiAlt_${v}_Full-Setup.msi"');
+    expect(prepare).toContain('url = "$baseUrl/$fullMsiName"');
+    expect(stepText("Configure updater endpoint for full edition")).toContain(
+      "update-manifests/$channel-nexus-ws/latest.json"
+    );
+    expect(stepText("Generate and push full edition update manifest")).toContain(
+      "RELEASE_CHANNEL: ${{ format('{0}-nexus-ws', steps.controls.outputs.channel) }}"
+    );
+    expect(yaml).not.toMatch(/_full-nexus-ws/);
+  });
+});
+
+/**
+ * A completa so aparece nos arquivos da release (decisao do dono, 10/10/2026).
+ * O texto da release diz o que ela e, em termos neutros, e manda a maioria
+ * para o `MultiAlt-Setup.msi`. Fica dentro da secao "## Download", que a
+ * janela de atualizacao do app descarta (src/releaseNotes.ts).
+ */
+describe("a edicao completa no texto da release", () => {
+  const finalizeLines = () => steps().find((s) => s.name === "Finalize release notes").lines;
+
+  it("tem a secao fixa do instalador completo, dentro do Download", () => {
+    // Os acentos graves vem escapados (`\``) dentro do template literal.
+    const body = finalizeLines().join("\n").replace(/\\`/g, "`");
+    expect(body).toContain('"### Full installer"');
+    expect(body).toContain(
+      "`MultiAlt_${version}_Full-Setup.msi` has every feature, including extra Windows integrations (window and audio control, local Web API, Nexus)."
+    );
+    expect(body).toContain("most people should use `MultiAlt-Setup.msi`.");
+    expect(body).toContain("It updates itself to the next full version.");
+    expect(body.indexOf("...fullInstaller")).toBeGreaterThan(body.indexOf('"## Download"'));
+    expect(body.indexOf("...fullInstaller")).toBeLessThan(body.indexOf("changesBlock,"));
+  });
+
+  it("o texto publicado nao fala de antivirus nem cita o nome antigo do arquivo", () => {
+    const code = finalizeLines()
+      .filter((l) => !l.trim().startsWith("//"))
+      .join("\n");
+    expect(code).not.toMatch(/virus|virustotal|trapmine|defender|malware|false positive/i);
+    expect(code).not.toMatch(/full-nexus-ws/);
+  });
+});

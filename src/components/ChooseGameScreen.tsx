@@ -1,0 +1,1007 @@
+import { useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { useStore } from "../store";
+import { accountLabel, hideAccountAvatar } from "../utils/accountName";
+import { useConfirm, usePrompt } from "../hooks/usePrompt";
+import { useJoinOnlineWarning } from "../hooks/useJoinOnlineWarning";
+import { useEscapeStack } from "../hooks/useEscapeStack";
+import { FavoritesTab } from "./server-list/FavoritesTab";
+import { GamesTab } from "./server-list/GamesTab";
+import { RecentTab } from "./server-list/RecentTab";
+import { JoinByFollowingToggle, useJoinByFollowing } from "./friends/JoinByFollowingToggle";
+import { AccountRecentGames } from "./server-list/AccountRecentGames";
+import { loadFavorites, recordRecentGame, updateFavorites } from "./server-list/types";
+import type { GameEntry } from "./server-list/types";
+import { FriendsTab } from "./friends/FriendsTab";
+import { ServersTab } from "./servers/ServersTab";
+import { tr, useTr } from "../i18n/text";
+import { ArrowLeft, User, Link2, AlertTriangle, X, Bookmark, Eye, Hourglass } from "lucide-react";
+import {
+  cancelWaitForPlayer,
+  startWaitForPlayer,
+  useWaitForPlayerHost,
+  useWaitWatch,
+} from "./follow/waitForPlayerWatch";
+import { WAIT_POLL_INTERVAL_MS } from "../utils/waitForPlayer";
+import { newPresetDraft } from "../utils/presets";
+import type { LaunchTarget } from "../store";
+import type { JoinTarget, PickedServer } from "../types";
+import { isLaunchAlreadyActiveError, launchErrorText } from "../utils/robloxErrors";
+import { TourButton } from "./tour/TourButton";
+
+/**
+ * Só as formas de escolher o jogo. Console e Windows viraram a página Console
+ * da barra lateral (11/10/2026), e as listas da sessão moram na página Session.
+ */
+type TabId = "favorites" | "games" | "recent" | "servers" | "friends" | "follow";
+
+/** Extra launch parameters for targets that were already resolved (join links). */
+type LaunchExtras = Pick<LaunchTarget, "launchData" | "joinVip" | "linkCode" | "followUserId">;
+/**
+ * `quickJoin`: "Entrar no jogo" dos Favoritos, Jogos e Recentes — sem servidor
+ * escolhido. Os filtros da aba Servidores (preferência, região) não valem aí
+ * (pedido do dono, 15/10/2026): uma conta entra direto (o Roblox escolhe o
+ * servidor, na hora); várias procuram só um servidor onde caibam juntas.
+ */
+type LaunchOptions = LaunchExtras & { quickJoin?: boolean };
+
+/** Result of a launch attempt, so callers can surface the failure inline. */
+type LaunchResult = { ok: boolean; error?: string };
+
+/** Launches all selected accounts into a given place/job. */
+/**
+ * Contas cujo launch está na preparação (conferindo presença, escolhendo
+ * servidor) — compartilhado entre todas as abas, que têm cada uma o seu
+ * `useLauncher`. Ver a trava de duplo clique em `launchAll`.
+ */
+const launchesPreparing = new Set<number>();
+
+export function resetLaunchesPreparingForTests() {
+  launchesPreparing.clear();
+}
+
+function useLauncher() {
+  const store = useStore();
+  const confirmJoinOnline = useJoinOnlineWarning();
+  const confirm = useConfirm();
+
+  /**
+   * Resolve o servidor do lote conforme a preferência do usuário
+   * (`Random`/`Emptiest`/`Fullest`, com filtro de país opcional).
+   *
+   * Resolvido **uma vez** para o lote inteiro: todas as contas recebem o mesmo
+   * Job ID e caem juntas. Só roda quando o usuário não escolheu servidor — um
+   * Job ID explícito, um VIP ou o Follow sempre vencem a preferência.
+   *
+   * Falha aqui nunca cancela o launch: sem servidor resolvido o lote segue com
+   * Job vazio, que é o comportamento de sempre.
+   */
+  async function resolvePreferredJob(
+    userIds: number[],
+    placeId: number,
+    quickJoin = false
+  ): Promise<{ jobId: string; cancelled: boolean }> {
+    // Entrada rápida com várias contas: só o "mesmo servidor com vaga para
+    // todas" (melhor encaixe), sem a preferência nem o filtro de região.
+    const preference = quickJoin ? "bestfit" : store.serverPreference;
+    const regionFilter = quickJoin ? "" : store.serverRegionFilter;
+    if (preference === "none" || userIds.length === 0) {
+      return { jobId: "", cancelled: false };
+    }
+    try {
+      const picked = await invoke<PickedServer>("pick_server", {
+        userId: userIds[0],
+        placeId,
+        preference,
+        accounts: userIds.length,
+        countryCode: regionFilter || null,
+      });
+      if (picked.regionFallback) {
+        const ok = await confirm(
+          tr("No server found in {{region}}. Join the best available one instead?", {
+            region: regionFilter,
+          })
+        );
+        if (!ok) return { jobId: "", cancelled: true };
+      }
+      return { jobId: picked.jobId, cancelled: false };
+    } catch (e) {
+      store.addToast(tr("Could not pick a server: {{error}}", { error: String(e) }));
+      return { jobId: "", cancelled: false };
+    }
+  }
+
+  async function launchAll(
+    userIds: number[],
+    placeId: number,
+    jobId: string = "",
+    onStarted?: () => void,
+    options?: LaunchOptions
+  ): Promise<LaunchResult> {
+    const { quickJoin = false, ...extras } = options ?? {};
+    // Duplo clique (relato do dono, 15/10/2026): entre o clique e a fila
+    // existir, a tela confere quem está online e escolhe o servidor — alguns
+    // segundos sem resposta. O segundo clique abria a mesma conta de novo e o
+    // Roblox derrubava uma das duas (erro 276). Conta já em preparação aqui
+    // não começa outro launch.
+    if (userIds.some((id) => launchesPreparing.has(id))) {
+      const error = tr("This launch is already starting");
+      store.addToast(error);
+      return { ok: false, error };
+    }
+    userIds.forEach((id) => launchesPreparing.add(id));
+    // Resposta na hora: fecha a Escolher jogo e vai para a Sessão, que mostra
+    // a preparação ("Escolhendo servidor...") e, depois, a fila.
+    onStarted?.();
+    store.setLaunchPreparing({ userIds, step: "checking" });
+    try {
+      if (!(await confirmJoinOnline(userIds))) return { ok: false };
+
+      // A preferência só entra quando o usuário não escolheu servidor (e não
+      // quando se segue alguém: aí quem escolhe o servidor é o Roblox).
+      // Uma conta na entrada rápida: nada a buscar — o Roblox põe a conta num
+      // servidor na hora. Era aqui que o clique demorava segundos.
+      // Com o Shuffle Job ID ligado, nada de servidor único para o lote: o
+      // shuffle pede servidores diferentes, e o backend só sorteia com Job ID
+      // vazio (antes a preferência "bestfit" punha todas no mesmo servidor).
+      const needsServer =
+        !jobId.trim() && !extras.joinVip && !extras.followUserId && !store.shuffleJobId;
+      if (needsServer && !(quickJoin && userIds.length === 1)) {
+        store.setLaunchPreparing({ userIds, step: "server" });
+        const preferred = await resolvePreferredJob(userIds, placeId, quickJoin);
+        if (preferred.cancelled) return { ok: false };
+        jobId = preferred.jobId;
+      }
+      store.setLaunchPreparing({ userIds, step: "starting" });
+      return await startLaunch(userIds, placeId, jobId, extras);
+    } finally {
+      userIds.forEach((id) => launchesPreparing.delete(id));
+      store.setLaunchPreparing(null);
+    }
+  }
+
+  async function startLaunch(
+    userIds: number[],
+    placeId: number,
+    jobId: string,
+    extras?: LaunchExtras
+  ): Promise<LaunchResult> {
+    // Keep the launch input fields in sync for the UI, but pass the target
+    // explicitly to the launch call. setPlaceId/setJobId are async state
+    // updates, so the launch closure would otherwise read the PREVIOUS
+    // place/job — this is what caused clicking a game's VIP to sometimes join
+    // the previously-selected game's VIP instead.
+    const placeIdText = String(placeId);
+    const target: LaunchTarget = { placeId: placeIdText, jobId, ...(extras || {}) };
+    store.setPlaceId(placeIdText);
+    // The visible Job ID field holds the VIP code in its `vip:` form so a
+    // manual re-launch from the field hits the same private server.
+    store.setJobId(extras?.joinVip && extras.linkCode ? `vip:${extras.linkCode}` : jobId);
+    try {
+      // "Seguir" só existe no lote (`launch_multiple`), que aceita uma conta.
+      if (userIds.length === 1 && !extras?.followUserId) {
+        const attempt = await store.joinServer(userIds[0], target);
+        if (attempt !== "started") {
+          // O store já avisou (recusa) ou já pôs a faixa de erro (falha): aqui só
+          // não se pode devolver `ok`, senão a tela anuncia um launch que não
+          // aconteceu. A frase da recusa vai para a linha inline de quem a mostra.
+          if (attempt === "refused") {
+            return { ok: false, error: tr("A launch is already in progress") };
+          }
+          return { ok: false };
+        }
+      } else {
+        await store.launchMultiple(userIds, target);
+      }
+      // Recent games are recorded by the store on a successful launch.
+      return { ok: true };
+    } catch (e) {
+      if (isLaunchAlreadyActiveError(e)) {
+        // Recusa por sequência já em andamento: o store já avisou com um toast
+        // traduzido. Repetir aqui mostraria a mesma frase duas vezes, e o
+        // "Launch failed: {{error}}" despejaria o código do backend na tela.
+        return { ok: false, error: tr("A launch is already in progress") };
+      }
+      store.addToast(tr("Launch failed: {{error}}", { error: launchErrorText(e, tr) }));
+      return { ok: false, error: launchErrorText(e, tr) };
+    }
+  }
+
+  return launchAll;
+}
+
+// ── Join link section ─────────────────────────────────────────────────────────
+/**
+ * Resolves a pasted Roblox link (experience invite, VIP/private server, plain
+ * game, `roblox://` deep link, `ro.blox.com` short link) through the backend
+ * and launches every selected account into the resolved target.
+ */
+function JoinLinkSection({ userIds, onOpenSession }: { userIds: number[]; onOpenSession?: () => void }) {
+  const t = useTr();
+  const launchAll = useLauncher();
+  const [link, setLink] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [resolved, setResolved] = useState<JoinTarget | null>(null);
+
+  function describeTarget(target: JoinTarget): string {
+    const kindLabel =
+      target.kind === "invite"
+        ? t("Invite")
+        : target.kind === "private"
+          ? t("Private server")
+          : target.kind === "job"
+            ? t("Server")
+            : t("Game");
+    const parts = [kindLabel, t("place {{placeId}}", { placeId: String(target.placeId) })];
+    if (target.jobId) parts.push(t("server {{jobId}}", { jobId: target.jobId }));
+    return parts.join(" · ");
+  }
+
+  async function handleJoin() {
+    const value = link.trim();
+    if (!value || busy || userIds.length === 0) return;
+    setBusy(true);
+    setError(null);
+    setResolved(null);
+    try {
+      const target = await invoke<JoinTarget>("resolve_join_link", {
+        userId: userIds[0],
+        link: value,
+      });
+      setResolved(target);
+
+      // private → `joinVip` + code (launchMultiple re-encodes it as `vip:<code>`)
+      // invite/job → the resolved job id; place → no job at all.
+      const vipCode = (target.linkCode || target.accessCode || "").trim();
+      const isPrivate = target.kind === "private" && vipCode !== "";
+      const job = isPrivate || target.kind === "place" ? "" : target.jobId;
+
+      const result = await launchAll(userIds, target.placeId, job, undefined, {
+        launchData: target.launchData || undefined,
+        joinVip: isPrivate || undefined,
+        linkCode: isPrivate ? vipCode : undefined,
+      });
+      if (!result.ok && result.error) setError(result.error);
+    } catch (e) {
+      // Keep the typed link so the user can fix it.
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="theme-panel theme-border border rounded-xl p-5 mb-4">
+      <div className="flex items-start justify-between mb-1">
+        <h3 className="text-sm font-semibold text-[var(--panel-fg)] flex items-center gap-1.5">
+          <Link2 size={14} strokeWidth={1.5} />
+          {t("Join link")}
+        </h3>
+        <span className="text-[11px] bg-[var(--accent-soft)] text-[var(--accent-color)] px-2 py-0.5 rounded-md font-medium">
+          {userIds.length === 1 ? t("1 account") : t("{{count}} accounts", { count: userIds.length })}
+        </span>
+      </div>
+      <p className="text-[12px] theme-muted mb-4 leading-relaxed">
+        {t("Paste an experience invite, a VIP/private server link or a plain game link. All selected accounts join the same place.")}
+      </p>
+
+      <label className="text-[12px] theme-label font-medium block mb-1.5">{t("Link")}</label>
+      <div className="flex gap-2 mb-3">
+        <input
+          value={link}
+          onChange={(e) => setLink(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") handleJoin();
+          }}
+          placeholder={t("e.g. https://www.roblox.com/share?code=abc123&type=ExperienceInvite")}
+          className="sidebar-input flex-1 min-w-0"
+          spellCheck={false}
+          autoComplete="off"
+          disabled={busy}
+        />
+        <button
+          onClick={handleJoin}
+          disabled={busy || !link.trim() || userIds.length === 0}
+          style={{ width: "auto" }}
+          className="sidebar-btn theme-btn shrink-0 px-4 disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {busy ? t("Resolving link...") : t("Join")}
+        </button>
+      </div>
+
+      {resolved && (
+        <div className="flex items-center justify-between gap-2 text-[12px] text-[var(--panel-fg)] bg-[var(--panel-soft)] border theme-border rounded-lg px-3 py-2 mb-2">
+          <span className="truncate">{describeTarget(resolved)}</span>
+          {/* Quem está entrando aparece na página Session. */}
+          {onOpenSession && (
+            <button
+              onClick={onOpenSession}
+              className="shrink-0 text-[12px] theme-muted hover:text-[var(--panel-fg)] transition-colors"
+            >
+              {t("Open Session")}
+            </button>
+          )}
+        </div>
+      )}
+
+      {resolved?.note && (
+        <div className="flex items-start gap-2 text-[12px] text-amber-400 bg-[var(--panel-soft)] border theme-border rounded-lg px-3 py-2 mb-2 leading-relaxed">
+          <AlertTriangle size={13} strokeWidth={1.5} className="shrink-0 mt-[2px]" />
+          <span>
+            {t("This invite is no longer valid ({{note}}) — joining the game's public servers instead.", {
+              note: resolved.note,
+            })}
+          </span>
+        </div>
+      )}
+
+      {error && (
+        <div className="flex items-start gap-2 text-[12px] text-red-400 bg-[var(--panel-soft)] border theme-border rounded-lg px-3 py-2 leading-relaxed">
+          <AlertTriangle size={13} strokeWidth={1.5} className="shrink-0 mt-[2px]" />
+          <span className="break-words">{error}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Follow Tab ────────────────────────────────────────────────────────────────
+/** Presença do alvo do Follow — o backend devolve o place e o Job ID do servidor. */
+type FollowPresence = {
+  userPresenceType?: number;
+  user_presence_type?: number;
+  placeId?: number | null;
+  place_id?: number | null;
+  rootPlaceId?: number | null;
+  root_place_id?: number | null;
+  gameId?: string | null;
+  game_id?: string | null;
+};
+
+function FollowTab({
+  userIds,
+  onLaunchStarted,
+  onOpenSession,
+}: {
+  userIds: number[];
+  onLaunchStarted?: () => void;
+  /** O "Open Session" do link resolvido: aí a pessoa pediu a Session. */
+  onOpenSession?: () => void;
+}) {
+  const t = useTr();
+  const store = useStore();
+  const confirm = useConfirm();
+  const launchAll = useLauncher();
+  const [joinByFollowing] = useJoinByFollowing();
+  const [followUser, setFollowUser] = useState("");
+  const [launching, setLaunching] = useState(false);
+  /** Jogador que não deu para seguir agora: oferece esperar por ele. */
+  const [waitOffer, setWaitOffer] = useState<{ userId: number; name: string } | null>(null);
+  const watch = useWaitWatch();
+
+  /**
+   * Resolve o servidor do alvo UMA vez e manda todas as contas selecionadas
+   * para lá com `launchAll`.
+   *
+   * Isto já foi um laço próprio de `launch_roblox` com `sleep(3000)` entre
+   * contas — o que furava o piso anti-captcha de 8 s que `launch_multiple`
+   * aplica no backend. Nada aqui pode voltar a lançar conta por conta.
+   */
+  async function handleFollow() {
+    if (!followUser.trim()) return;
+    setLaunching(true);
+    setWaitOffer(null);
+    try {
+      const user = await invoke<{ id: number }>("lookup_user", { username: followUser.trim() });
+      const offerWait = () => setWaitOffer({ userId: user.id, name: followUser.trim() });
+      const presence = await invoke<FollowPresence[]>("get_presence", { userIds: [user.id] });
+      const entry = presence?.[0];
+      const presenceType = entry?.userPresenceType ?? entry?.user_presence_type ?? 0;
+      const jobId = entry?.gameId ?? entry?.game_id ?? "";
+      const serverPlace = entry?.placeId ?? entry?.place_id ?? null;
+      const rootPlace = entry?.rootPlaceId ?? entry?.root_place_id ?? null;
+      // Com Job ID, o place é o do servidor: o Job ID é de um servidor do place
+      // em que o jogador está, que pode ser um sub-place — o raiz + esse Job ID
+      // pede um servidor que não existe no raiz ("This experience has ended").
+      // Sem Job ID entra-se num servidor público do jogo, e aí é o raiz: um
+      // sub-place de teleporte pode não aceitar entrada direta.
+      const placeId = jobId ? (serverPlace ?? rootPlace) : (rootPlace ?? serverPlace);
+
+      if (joinByFollowing) {
+        // Seguindo (como o RAM antigo): o Roblox acha o servidor do jogador,
+        // mesmo com ele escondido. Só não adianta com ele offline.
+        if (presenceType === 0) {
+          store.addToast(tr("{{name}} is not in a game right now.", { name: followUser }));
+          offerWait();
+          return;
+        }
+        const followed = await launchAll(userIds, rootPlace ?? serverPlace ?? 0, "", onLaunchStarted, {
+          followUserId: user.id,
+        });
+        if (followed.ok) {
+          store.addToast(
+            tr("Following {{name}} with {{count}} account(s)...", { name: followUser, count: userIds.length })
+          );
+        }
+        return;
+      }
+
+      if (presenceType < 2 || !placeId) {
+        store.addToast(tr("{{name}} is not in a game right now.", { name: followUser }));
+        offerWait();
+        return;
+      }
+      if (!jobId) {
+        // Em jogo, mas com o servidor escondido pela privacidade: só dá para
+        // cair num servidor público do mesmo jogo.
+        const ok = await confirm(
+          tr("{{name}}'s server is not visible. Join a public server of that game instead?", {
+            name: followUser,
+          })
+        );
+        if (!ok) {
+          // Recusou o servidor público: pode esperar o servidor dele aparecer.
+          offerWait();
+          return;
+        }
+      }
+
+      const result = await launchAll(userIds, placeId, jobId, onLaunchStarted);
+      if (result.ok) {
+        store.addToast(
+          tr("Following {{name}} with {{count}} account(s)...", { name: followUser, count: userIds.length })
+        );
+      }
+    } catch (e) {
+      store.addToast(tr("Follow failed: {{error}}", { error: String(e) }));
+    } finally {
+      setLaunching(false);
+    }
+  }
+
+  return (
+    <div className="h-full overflow-y-auto p-5">
+      {/* Join link */}
+      <JoinLinkSection userIds={userIds} onOpenSession={onOpenSession} />
+
+      {/* Follow card */}
+      <div className="theme-panel theme-border border rounded-xl p-5 mb-4">
+        <div className="flex items-start justify-between mb-1">
+          <h3 className="text-sm font-semibold text-[var(--panel-fg)]">{t("Follow a Player")}</h3>
+          <span className="text-[11px] bg-[var(--accent-soft)] text-[var(--accent-color)] px-2 py-0.5 rounded-md font-medium">
+            {userIds.length === 1
+              ? t("1 account")
+              : t("{{count}} accounts", { count: userIds.length })}
+          </span>
+        </div>
+        <p className="text-[12px] theme-muted mb-4 leading-relaxed">
+          {userIds.length === 1
+            ? t("This account will join the game that this player is currently in.")
+            : t("All {{count}} selected accounts will join the same game that this player is currently in, launched one at a time.", { count: userIds.length })}
+        </p>
+
+        <label className="text-[12px] theme-label font-medium block mb-1.5">
+          {t("Roblox Username")}
+        </label>
+        <div className="flex gap-2 mb-3">
+          <input
+            value={followUser}
+            onChange={(e) => setFollowUser(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && handleFollow()}
+            placeholder={t("e.g. Builderman")}
+            className="sidebar-input flex-1 min-w-0"
+            disabled={launching}
+          />
+          <button
+            onClick={handleFollow}
+            disabled={launching || !followUser.trim()}
+            style={{ width: "auto" }}
+            className="sidebar-btn theme-btn shrink-0 px-4 disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {launching ? t("Launching...") : t("Follow")}
+          </button>
+        </div>
+
+        {watch ? (
+          <div
+            data-testid="follow-wait-status"
+            className="flex items-start gap-2 text-[12px] text-[var(--panel-fg)] bg-[var(--panel-soft)] border theme-border rounded-lg px-3 py-2 mb-3 leading-relaxed"
+          >
+            <Eye size={13} strokeWidth={1.5} className="shrink-0 mt-[3px] theme-accent" />
+            <div className="min-w-0 flex-1">
+              <div>
+                {watch.phase === "launching"
+                  ? t("{{name}} is in a game. Launching...", { name: watch.name })
+                  : t("Watching {{name}}… (checks every {{seconds}} s)", {
+                      name: watch.name,
+                      seconds: Math.round(WAIT_POLL_INTERVAL_MS / 1000),
+                    })}
+              </div>
+              {watch.lastError && watch.phase === "watching" && (
+                <div className="text-[11px] text-amber-400 break-words">
+                  {t("Last check failed: {{error}}. Next check at {{time}}.", {
+                    error: watch.lastError,
+                    time: new Date(watch.nextCheckAt).toLocaleTimeString(),
+                  })}
+                </div>
+              )}
+            </div>
+            {watch.phase === "watching" && (
+              <button
+                onClick={cancelWaitForPlayer}
+                className="shrink-0 text-[12px] px-2.5 py-1 rounded-md theme-btn-ghost border theme-border transition-colors"
+              >
+                {t("Cancel")}
+              </button>
+            )}
+          </div>
+        ) : (
+          waitOffer && (
+            <div
+              data-testid="follow-wait-offer"
+              className="flex items-start gap-2 text-[12px] text-[var(--panel-fg)] bg-[var(--panel-soft)] border theme-border rounded-lg px-3 py-2 mb-3 leading-relaxed"
+            >
+              <Hourglass size={13} strokeWidth={1.5} className="shrink-0 mt-[3px] theme-muted" />
+              <div className="min-w-0 flex-1">
+                <div>{t("{{name}} is not in a game you can join yet.", { name: waitOffer.name })}</div>
+                {!joinByFollowing && (
+                  <div className="text-[11px] theme-muted">
+                    {t("With “Join by following” off, their server must also be visible.")}
+                  </div>
+                )}
+              </div>
+              <button
+                onClick={() => {
+                  startWaitForPlayer({ targetUserId: waitOffer.userId, name: waitOffer.name, userIds });
+                  setWaitOffer(null);
+                }}
+                disabled={userIds.length === 0}
+                style={{ width: "auto" }}
+                className="sidebar-btn theme-btn shrink-0 px-3 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {t("Wait until they're in a game")}
+              </button>
+            </div>
+          )
+        )}
+
+        <JoinByFollowingToggle className="mb-3" />
+
+        <div className="text-[12px] theme-muted bg-[var(--panel-soft)] rounded-lg px-3 py-2 leading-relaxed">
+          ℹ️ {t("If the player is not in a game, nothing opens. If their server is hidden, you'll be asked before joining a public server of the same game. The player's profile must be public.")}
+        </div>
+      </div>
+
+      {/* Divider */}
+      <div className="theme-border border-t my-4" />
+
+      {/* Other batch tools */}
+      <div className="theme-panel theme-border border rounded-xl p-4">
+        <h3 className="text-xs font-semibold theme-muted uppercase tracking-wider mb-3">
+          {t("Other Batch Tools")}
+        </h3>
+        <div className="grid grid-cols-2 gap-2">
+          {[
+            { label: t("Server List"), icon: "🖥", onClick: () => store.setServerListOpen(true) },
+            { label: t("Utilities"), icon: "🔧", onClick: () => store.setAccountUtilsOpen(true) },
+            { label: t("Auto Rejoin"), icon: "🤖", onClick: () => store.openBottingDialog() },
+            { label: t("Scripts"), icon: "📜", onClick: () => store.setScriptsOpen(true) },
+          ].map(({ label, icon, onClick }) => (
+            <button
+              key={label}
+              onClick={onClick}
+              className="sidebar-btn-tool flex items-center gap-2 text-left"
+            >
+              <span>{icon}</span>
+              <span className="text-[12px]">{label}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Main Screen ───────────────────────────────────────────────────────────────
+export function ChooseGameScreen() {
+  const t = useTr();
+  const store = useStore();
+  const prompt = usePrompt();
+  const launchAll = useLauncher();
+  const [joinByFollowing] = useJoinByFollowing();
+  const [activeTab, setActiveTab] = useState<TabId>("favorites");
+
+  const accounts = store.selectedAccounts;
+  const userIds = accounts.map((a) => a.UserID);
+  const maxRecent = parseInt(store.settings?.General?.MaxRecentGames || "8") || 8;
+
+  // Esta tela fica na **base** da pilha de Escape: qualquer diálogo ou popover
+  // aberto por cima monta depois e consome o Escape antes. Antes ela era sempre
+  // o primeiro listener de `window`, então um Escape fechava o diálogo de cima
+  // **e** a tela de trás no mesmo evento. `ignoreFromFields` deixa o Escape
+  // digitado num campo (o link da aba Follow, por exemplo) passar direto.
+  useEscapeStack(true, () => store.setChooseGameOpen(false), { ignoreFromFields: true });
+
+  // ── Game selection handlers ────────────────────────────────────────────────
+
+  /**
+   * Lançou: fecha a Choose Game e volta para a lista de contas, que mostra o
+   * estado de cada conta ao vivo (Entrando, Jogando...). Pedido do dono,
+   * 12/10/2026: antes ia para a Session e a Choose Game ficava aberta por
+   * baixo — clicar em Contas a reabria com as contas do lote anterior. A fila
+   * continua na Session (chip e barra lateral levam até ela).
+   */
+  const goToSession = () => store.setActivePage("session");
+  const backToAccounts = () => {
+    // 15/10/2026 (pedido do dono): o launch leva para a Sessão, onde a
+    // preparação e a fila aparecem na hora. A Escolher jogo fecha junto — em
+    // 12/10 o problema era ela ficar aberta por baixo da Sessão e reabrir com
+    // as contas do lote anterior ao clicar em Contas.
+    store.setChooseGameOpen(false);
+    store.setActivePage("session");
+  };
+
+  /**
+   * A espera da aba Seguir ("Wait until they're in a game") vive enquanto esta
+   * tela vive: trocar de aba não a para, fechar a Choose Game para. O launch é
+   * o mesmo `launchAll` do Follow — seguindo o jogador ou no servidor exato,
+   * conforme o toggle no momento em que ele entra.
+   */
+  useWaitForPlayerHost({
+    byFollowing: () => joinByFollowing,
+    currentUserIds: () => userIds,
+    notify: store.addToast,
+    launch: async (watch, join) => {
+      const result = await launchAll(
+        watch.userIds,
+        join.placeId,
+        join.jobId,
+        backToAccounts,
+        join.follow ? { followUserId: watch.targetUserId } : undefined
+      );
+      if (result.ok) {
+        store.addToast(
+          tr("Following {{name}} with {{count}} account(s)...", { name: watch.name, count: watch.userIds.length })
+        );
+      }
+      return result.ok;
+    },
+  });
+
+  /**
+   * Clique no card, nas abas Games/Recent.
+   *
+   * Já lançou direto — o único freio era `confirmJoinOnline`, que só entra
+   * com a conta online, então uma conta offline lançava sem passo nenhum no
+   * meio. Desde o P1, Games/Recent já têm a própria ação "Join Game"
+   * (`handleJoinGame`, no ícone da linha), então o card lançando também era
+   * um gesto duplicado. Agora o card só abre os servidores do jogo — mesmo
+   * destino que `ServerListDialog.handleSelectGame` já usa para o clique no
+   * card lá.
+   *
+   * Decisão sobre o Recent: como o jogo só entra na lista num launch
+   * bem-sucedido (`store.tsx`), e o card não lança mais nada, gravamos aqui
+   * manualmente — a mesma saída que o `ServerListDialog` já usa — para o
+   * jogo clicado não sumir do Recent.
+   */
+  function handleSelectGame(placeId: number, name?: string, iconUrl?: string | null) {
+    void recordRecentGame(placeId, userIds[0] ?? null, maxRecent, { name, iconUrl }).catch(() => {});
+    handleBrowseServers(placeId);
+  }
+
+  async function handleFavoritesSelectGame(placeId: number, privateServer?: string) {
+    await launchAll(userIds, placeId, privateServer || "", backToAccounts, { quickJoin: true });
+  }
+
+  async function handleJoinGame(placeId: number) {
+    await launchAll(userIds, placeId, "", backToAccounts, { quickJoin: true });
+  }
+
+  /** Vai para a aba Servers já com o place do jogo clicado. */
+  function handleBrowseServers(placeId: number) {
+    store.setPlaceId(String(placeId));
+    setActiveTab("servers");
+  }
+
+  /**
+   * Abre o Auto Rejoin **com o jogo escolhido**. O place vai explícito na
+   * abertura porque o rascunho salvo (`General.BottingDraftPlaceId`) vence a
+   * store: sem isso, escolher o jogo aqui e ver outro place no diálogo.
+   */
+  function handleBottingForGame(placeId: number) {
+    store.setPlaceId(String(placeId));
+    store.openBottingDialog(String(placeId));
+  }
+
+  /** Abre os Scripts com este jogo como place atual (é o que `ram.window` expõe). */
+  function handleScriptsForGame(placeId: number) {
+    store.setPlaceId(String(placeId));
+    store.setScriptsOpen(true);
+  }
+
+  /**
+   * Tira uma conta do lote pelo "x" do chip. A última não sai: um lote vazio
+   * deixaria a tela sem nada para lançar.
+   */
+  function handleRemoveAccount(userId: number) {
+    if (userIds.length <= 1) return;
+    store.setSelectedIds(new Set(userIds.filter((id) => id !== userId)));
+  }
+
+  async function handleAddFavorite(game: GameEntry) {
+    if (loadFavorites().some((f) => f.placeId === game.placeId)) {
+      store.addToast(t("Already in favorites"));
+      return;
+    }
+    const customName = await prompt(t("Favorite name:"), game.name);
+    if (!customName?.trim()) return;
+    // Lê-muda-grava depois do prompt: a lista lida antes dele pode ter mudado
+    // enquanto o diálogo estava aberto (ícones chegando, outra tela). Gravar a
+    // cópia de antes apagaria o que entrou no meio.
+    const saved = updateFavorites((list) =>
+      list.some((f) => f.placeId === game.placeId)
+        ? list
+        : [...list, { placeId: game.placeId, name: customName.trim(), iconUrl: game.iconUrl, addedAt: Date.now() }]
+    );
+    if (!saved) return;
+    store.addToast(t("Added to favorites"));
+  }
+
+  // ── Tab definitions ────────────────────────────────────────────────────────
+  /**
+   * Cada aba explica o que faz na dica 💡. Algumas ganham um atalho ao lado da
+   * dica: é o caminho curto para a aba que resolve o caso que a pessoa tem em
+   * mãos (colar um link, por exemplo) sem duplicar a lógica que resolve.
+   */
+  const TABS: { id: TabId; label: string; hint?: string; action?: { label: string; onClick: () => void } }[] = [
+    {
+      id: "favorites",
+      label: t("Favorites"),
+      hint: t("Your saved games with VIP server links. Click a game to expand and choose public or VIP."),
+    },
+    {
+      id: "games",
+      label: t("Games"),
+      // Clicar no card não lança mais direto (item de usabilidade: era um
+      // duplicado do botão "Join Game" da própria linha, sem nenhum passo no
+      // meio). A dica tinha que parar de prometer isso.
+      hint: t("Browse Roblox games. Click a game to see its servers, or use Join Game to launch directly."),
+    },
+    {
+      id: "recent",
+      label: t("Recent"),
+      hint: t("Games opened by MultiAlt and, below, the games each selected account played recently on Roblox. Click a game to see its servers, or use Join Game to launch directly."),
+    },
+    {
+      id: "servers",
+      label: t("Servers"),
+      hint: t("Public servers of a place. Pick one and every selected account joins it; load regions to find a specific country."),
+      // O campo daqui só aceita Place ID: quem colou um convite ou um link de
+      // servidor privado resolve isso na aba Follow, a um clique.
+      action: { label: t("Paste a join link"), onClick: () => setActiveTab("follow") },
+    },
+    {
+      id: "friends",
+      label: t("Friends"),
+      hint: t("Online friends of each selected account. Click a friend to send every selected account into their server."),
+    },
+    {
+      id: "follow",
+      label: t("Follow"),
+      hint: t("Paste any Roblox link here — experience invite, VIP/private server or a plain game link — or follow a player into the game they are in right now."),
+    },
+  ];
+  const activeTabDef = TABS.find((tab) => tab.id === activeTab);
+  const activeHint = activeTabDef?.hint;
+  const activeAction = activeTabDef?.action;
+
+  return (
+    <div data-tour="choose-game" className="flex-1 flex flex-col min-h-0 animate-fade-in">
+
+      {/* ── Header ── */}
+      <div className="shrink-0 px-4 pt-3 pb-0 theme-border border-b">
+        {/* Top row: back + title + tutorial */}
+        <div className="flex items-center gap-3 mb-3">
+          <button
+            onClick={() => store.setChooseGameOpen(false)}
+            className="flex items-center gap-1.5 text-[12px] theme-muted hover:text-[var(--panel-fg)] px-2.5 py-1.5 rounded-md theme-btn-ghost border theme-border transition-colors"
+          >
+            <ArrowLeft size={13} strokeWidth={1.5} />
+            {t("Back")}
+          </button>
+          <div>
+            <h2 className="text-sm font-semibold text-[var(--panel-fg)]">
+              {t("Choose Game")}
+            </h2>
+            <p className="text-[11px] theme-muted">
+              {accounts.length === 1
+                ? t("1 account will be launched")
+                : t("{{count}} accounts will be launched together", { count: accounts.length })}
+            </p>
+          </div>
+          {/* Guarda estas contas (e o jogo do campo, se houver) como preset. */}
+          <button
+            onClick={() =>
+              store.openPresetsDialog(newPresetDraft(userIds, parseInt(store.placeId) || 0))
+            }
+            className="ml-auto flex items-center gap-1.5 text-[12px] theme-muted hover:text-[var(--panel-fg)] px-2.5 py-1.5 rounded-md theme-btn-ghost border theme-border transition-colors"
+            title={t("Save these accounts and a game as a preset, to launch them later in one click")}
+          >
+            <Bookmark size={13} strokeWidth={1.5} />
+            {t("Save as preset")}
+          </button>
+          <TourButton tour="choose-game" />
+        </div>
+
+        {/* Account chips */}
+        <div data-tour="cg-accounts" className="flex flex-wrap gap-1.5 pb-3 max-h-[52px] overflow-hidden">
+          {accounts.slice(0, 8).map((a) => {
+            const name = accountLabel(a, store);
+            const avatarUrl = hideAccountAvatar(store) ? undefined : store.avatarUrls.get(a.UserID);
+            return (
+              <div
+                key={a.UserID}
+                className="group flex items-center gap-1.5 bg-[var(--panel-soft)] border theme-border rounded-full pl-0.5 pr-1 py-0.5 text-[12px] text-[var(--panel-fg)]"
+              >
+                {avatarUrl ? (
+                  <img src={avatarUrl} alt="" className="w-4 h-4 rounded-full" />
+                ) : (
+                  <div className="w-4 h-4 rounded-full bg-[var(--panel-muted)] flex items-center justify-center">
+                    <User size={8} strokeWidth={1.5} className="theme-muted" />
+                  </div>
+                )}
+                <span className="max-w-[100px] truncate">{name}</span>
+                <button
+                  onClick={() => handleRemoveAccount(a.UserID)}
+                  disabled={accounts.length <= 1}
+                  aria-label={t("Remove {{name}} from this launch", { name })}
+                  title={
+                    accounts.length <= 1
+                      ? t("Keep at least one account selected")
+                      : t("Remove from this launch")
+                  }
+                  className="w-4 h-4 rounded-full flex items-center justify-center theme-muted hover:text-[var(--panel-fg)] hover:bg-[var(--panel-muted)] disabled:opacity-0 transition-colors"
+                >
+                  <X size={10} strokeWidth={2} />
+                </button>
+              </div>
+            );
+          })}
+          {accounts.length > 8 && (
+            <div className="bg-[var(--panel-soft)] border theme-border rounded-full px-2.5 py-0.5 text-[12px] theme-muted">
+              +{accounts.length - 8}
+            </div>
+          )}
+        </div>
+
+        {/* Tab bar */}
+        <div data-tour="cg-tabs" className="flex gap-0 -mb-px">
+          {TABS.map((tab) => (
+            <button
+              key={tab.id}
+              data-tour={`cg-tab-${tab.id}`}
+              onClick={() => setActiveTab(tab.id)}
+              className={`px-4 py-2.5 text-[12px] border-b-2 transition-colors ${
+                activeTab === tab.id
+                  ? "border-[var(--accent-color)] text-[var(--panel-fg)] font-medium"
+                  : "border-transparent theme-muted hover:text-[var(--panel-fg)]"
+              }`}
+            >
+              {tab.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Dica + conteúdo da aba juntos: é a área que o tutorial aponta em cada aba. */}
+      <div data-tour="cg-panel" className="flex-1 min-h-0 flex flex-col">
+      {/* ── Tab hint ── */}
+      {activeHint && (
+        <div className="shrink-0 px-4 pt-2.5 pb-0">
+          <div className="flex items-center gap-3 text-[12px] theme-muted bg-[var(--panel-soft)] rounded-lg px-3 py-2 leading-relaxed border theme-border">
+            <p className="min-w-0">💡 {activeHint}</p>
+            {activeAction && (
+              <button
+                onClick={activeAction.onClick}
+                className="shrink-0 ml-auto flex items-center gap-1.5 text-[12px] px-2.5 py-1 rounded-md theme-btn-ghost border theme-border text-[var(--panel-fg)] transition-colors"
+              >
+                <Link2 size={12} strokeWidth={1.5} />
+                {activeAction.label}
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ── Tab content ── */}
+      {/* overflow-y-auto e não hidden: cada aba rola a si mesma (h-full), e
+          esta rolagem é a garantia para a que esquecer — em monitor pequeno o
+          conteúdo cortado sem barra de rolagem ficava inalcançável. */}
+      <div className="flex-1 min-h-0 overflow-y-auto">
+        {activeTab === "favorites" && (
+          <div className="h-full overflow-y-auto px-4 pt-3 pb-4">
+            <FavoritesTab
+              onSelectGame={handleFavoritesSelectGame}
+              addToast={store.addToast}
+              onBrowseServers={handleBrowseServers}
+              onBotting={handleBottingForGame}
+              onScripts={handleScriptsForGame}
+            />
+          </div>
+        )}
+        {activeTab === "games" && (
+          <div className="h-full overflow-y-auto px-4 pt-3 pb-4">
+            <GamesTab
+              onSelectGame={(placeId, name, iconUrl) => handleSelectGame(placeId, name, iconUrl)}
+              onJoinGame={handleJoinGame}
+              addToast={store.addToast}
+              onAddFavorite={handleAddFavorite}
+              onBrowseServers={(placeId) => handleBrowseServers(placeId)}
+              onBotting={handleBottingForGame}
+              onScripts={handleScriptsForGame}
+            />
+          </div>
+        )}
+        {activeTab === "recent" && (
+          <div className="h-full overflow-y-auto px-4 pt-3 pb-4 space-y-6">
+            {/* Em cima, os jogos abertos pelo MultiAlt (a lista de sempre);
+                embaixo, os recentes de cada conta no Roblox, como a aba Amigos. */}
+            <section data-testid="recent-opened-by-app">
+              <RecentTab
+                onSelectGame={(placeId, name, iconUrl) => handleSelectGame(placeId, name, iconUrl)}
+                onJoinGame={handleJoinGame}
+                maxRecent={maxRecent}
+                userId={userIds[0] ?? null}
+                onBrowseServers={handleBrowseServers}
+                onAddFavorite={handleAddFavorite}
+                onBotting={handleBottingForGame}
+                onScripts={handleScriptsForGame}
+                fill={false}
+                layout="rail"
+              />
+            </section>
+            <AccountRecentGames
+              userIds={userIds}
+              onSelectGame={(placeId, name, iconUrl) => handleSelectGame(placeId, name, iconUrl)}
+              onJoinGame={handleJoinGame}
+              onBrowseServers={handleBrowseServers}
+              onAddFavorite={handleAddFavorite}
+            />
+          </div>
+        )}
+        {activeTab === "servers" && (
+          <ServersTab
+            userIds={userIds}
+            placeId={store.placeId}
+            setPlaceId={store.setPlaceId}
+            launchAll={launchAll}
+            onLaunchStarted={backToAccounts}
+          />
+        )}
+        {activeTab === "friends" && (
+          <FriendsTab userIds={userIds} launchAll={launchAll} onLaunchStarted={backToAccounts} />
+        )}
+        {activeTab === "follow" && (
+          <FollowTab userIds={userIds} onLaunchStarted={backToAccounts} onOpenSession={goToSession} />
+        )}
+      </div>
+      </div>
+
+      {/* ── Launch progress ── */}
+      {store.launchProgress && (
+        <div className="shrink-0 px-4 py-2.5 border-t theme-border bg-[var(--panel-soft)] animate-fade-in">
+          <div className="flex items-center gap-2 text-[12px] theme-accent">
+            <span className="w-2 h-2 rounded-full bg-[var(--accent-color)] animate-pulse" />
+            {store.launchProgress.mode === "multi"
+              ? t("Launching {{current}}/{{total}} accounts...", {
+                  current: store.launchProgress.current,
+                  total: store.launchProgress.total,
+                })
+              : t("Launching account...")}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

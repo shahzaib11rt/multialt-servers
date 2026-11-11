@@ -1,0 +1,312 @@
+import "@testing-library/jest-dom/vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+
+vi.mock("../../store", async () => (await import("../../test-utils/renderWithStore")).storeModuleMock());
+vi.mock("@tauri-apps/api/core", async () => (await import("../../test-utils/tauriMocks")).tauriCoreMock());
+vi.mock("@tauri-apps/api/event", async () => (await import("../../test-utils/tauriMocks")).tauriEventMock());
+
+import { UpdateDialog, notesForUpdateDialog } from "./UpdateDialog";
+import i18n, { DEFAULT_LANGUAGE } from "../../i18n/index";
+import { setStore } from "../../test-utils/renderWithStore";
+import { emitTauriEvent, invokeMock, resetTauriMocks, setInvokeMap } from "../../test-utils/tauriMocks";
+import { UPDATE_HANDOFF_KEY } from "../../updateHandoff";
+
+const INFO = {
+  version: "0.1.7",
+  currentVersion: "0.1.6",
+  date: "",
+  body: "",
+  releaseChannel: "beta" as const,
+  featureChannel: "standard" as const,
+};
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => (resolve = r));
+  return { promise, resolve };
+}
+
+describe("UpdateDialog", () => {
+  beforeEach(async () => {
+    await i18n.changeLanguage(DEFAULT_LANGUAGE);
+    resetTauriMocks();
+    localStorage.clear();
+    // As notas vêm do GitHub; aqui não importam.
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: false, json: async () => ({}) })));
+    setStore({ updateDialogOpen: true, updateInfo: INFO });
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it("a barra do download acompanha o progresso que o backend manda", async () => {
+    const download = deferred();
+    setInvokeMap({ download_selected_update: () => download.promise });
+    render(<UpdateDialog />);
+
+    await userEvent.click(screen.getByRole("button", { name: "Download Update" }));
+    act(() => emitTauriEvent("update-download-progress", { downloaded: 512 * 1024, total: 1024 * 1024 }));
+
+    expect(await screen.findByText(/^50%/)).toBeInTheDocument();
+
+    await act(async () => download.resolve());
+    expect(await screen.findByRole("button", { name: "Install & Restart" })).toBeInTheDocument();
+  });
+
+  it("a troca para a edição completa baixa e instala sozinha, com o progresso no diálogo", async () => {
+    // Mesma versão, outra edição: é o que o botão da aba Distribute pede.
+    setStore({
+      updateDialogOpen: true,
+      updateInfo: { ...INFO, version: "0.1.6", featureChannel: "nexus-ws", autoInstall: true },
+    });
+    const download = deferred();
+    setInvokeMap({ download_selected_update: () => download.promise, install_selected_update: undefined });
+    render(<UpdateDialog />);
+
+    expect(screen.getByText("Getting the complete edition")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.filter((c) => c[0] === "download_selected_update")).toHaveLength(1)
+    );
+    act(() => emitTauriEvent("update-download-progress", { downloaded: 256 * 1024, total: 1024 * 1024 }));
+    expect(await screen.findByText(/^25%/)).toBeInTheDocument();
+
+    await act(async () => download.resolve());
+    expect(await screen.findByText("Installing v0.1.6")).toBeInTheDocument();
+    const installCalls = () => invokeMock.mock.calls.filter((c) => c[0] === "install_selected_update").length;
+    await waitFor(() => expect(installCalls()).toBe(1), { timeout: 3000 });
+    expect(invokeMock.mock.calls.filter((c) => c[0] === "download_selected_update")).toHaveLength(1);
+  });
+
+  it("uma atualização comum espera o clique para baixar", async () => {
+    setInvokeMap({ download_selected_update: undefined });
+    render(<UpdateDialog />);
+    await act(async () => {});
+    expect(invokeMock.mock.calls.filter((c) => c[0] === "download_selected_update")).toHaveLength(0);
+    expect(screen.getByRole("button", { name: "Download Update" })).toBeInTheDocument();
+  });
+
+  it("instalar mostra a tela de instalação, anota a versão e só então instala", async () => {
+    setInvokeMap({ download_selected_update: undefined, install_selected_update: undefined });
+    render(<UpdateDialog />);
+
+    await userEvent.click(screen.getByRole("button", { name: "Download Update" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Install & Restart" }));
+
+    expect(screen.getByText("Installing v0.1.7")).toBeInTheDocument();
+    expect(screen.getByText("MultiAlt will close and open again by itself in a few seconds.")).toBeInTheDocument();
+    expect(JSON.parse(localStorage.getItem(UPDATE_HANDOFF_KEY) ?? "{}")).toMatchObject({
+      from: "0.1.6",
+      to: "0.1.7",
+    });
+    // Dá tempo de ler a tela antes de o app fechar.
+    const installCalls = () => invokeMock.mock.calls.filter((c) => c[0] === "install_selected_update").length;
+    expect(installCalls()).toBe(0);
+
+    await waitFor(() => expect(installCalls()).toBe(1), { timeout: 3000 });
+  });
+
+  it("uma falha ao instalar apaga a anotação e mostra o erro", async () => {
+    setInvokeMap({
+      download_selected_update: undefined,
+      install_selected_update: () => Promise.reject("Failed to install update: boom"),
+    });
+    render(<UpdateDialog />);
+
+    await userEvent.click(screen.getByRole("button", { name: "Download Update" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Install & Restart" }));
+
+    expect(await screen.findByText("Failed to install update: boom", {}, { timeout: 3000 })).toBeInTheDocument();
+    expect(localStorage.getItem(UPDATE_HANDOFF_KEY)).toBeNull();
+  });
+});
+
+/**
+ * A página da release abre com "## Download" (o botão do instalador, para quem
+ * chega pelo GitHub). Dentro do app isso não serve — a atualização já baixa
+ * sozinha —, então a janela de atualização tira essa seção e mostra a partir
+ * do que mudou.
+ */
+describe("notas da atualização dentro do app", () => {
+  it("tiram a seção de download da página da release", () => {
+    const body = [
+      "## Download",
+      "",
+      "### [⬇ Download MultiAlt-Setup.msi](https://example.test/MultiAlt-Setup.msi)",
+      "",
+      "Open the file and follow the installer. That's it.",
+      "",
+      "<details>",
+      "<summary>Other files (you can ignore these)</summary>",
+      "",
+      "- `.sig` files: used by the automatic update.",
+      "",
+      "</details>",
+      "",
+      "## What's Changed",
+      "* New sidebar",
+      "",
+      "## Contributors",
+      "[@luanmacea](https://github.com/luanmacea)",
+    ].join("\n");
+    const notes = notesForUpdateDialog(body);
+    expect(notes).not.toMatch(/Download MultiAlt-Setup|Other files|## Download/);
+    expect(notes.startsWith("## What's Changed")).toBe(true);
+    expect(notes).toMatch(/## Contributors/);
+  });
+
+  it("deixam como estão as notas sem seção de download (releases antigas)", () => {
+    const body = "> [!WARNING]\n> Beta.\n\n## What's Changed\n* Fix";
+    expect(notesForUpdateDialog(body)).toBe(body);
+  });
+});
+
+/**
+ * O desenho das notas (lista, aviso, link do PR) saiu deste arquivo para ser
+ * dividido com a página de novidades. A janela tem que continuar igual.
+ */
+describe("notas da atualização — como aparecem na janela", () => {
+  beforeEach(async () => {
+    await i18n.changeLanguage(DEFAULT_LANGUAGE);
+    resetTauriMocks();
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: false, json: async () => ({}) })));
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it("desenham a lista, o aviso e o link do PR, sem a seção de download", async () => {
+    const body = [
+      "## Download",
+      "### [⬇ Download MultiAlt-Setup.msi](https://example.test/MultiAlt-Setup.msi)",
+      "",
+      "## What's Changed",
+      "> [!WARNING]",
+      "> Beta version.",
+      "",
+      "- New menu on the left",
+      "* Smoother updates by @luanmacea in #21",
+      "",
+      "## Contributors",
+      "[@luanmacea](https://github.com/luanmacea)",
+    ].join("\n");
+    setStore({ updateDialogOpen: true, updateInfo: { ...INFO, body } });
+    render(<UpdateDialog />);
+
+    const item = await screen.findByText("New menu on the left");
+    expect(item.tagName).toBe("LI");
+    expect(screen.getByText("Warning")).toBeInTheDocument();
+    expect(screen.getByText("Beta version.")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "#21" })).toHaveAttribute(
+      "href",
+      "https://github.com/luanmacea/MultiAlt/pull/21"
+    );
+    expect(screen.queryByText(/Download MultiAlt-Setup/)).not.toBeInTheDocument();
+  });
+
+  it("dizem quando não há notas", () => {
+    setStore({ updateDialogOpen: true, updateInfo: INFO });
+    render(<UpdateDialog />);
+    expect(screen.getByText("Could not load release notes")).toBeInTheDocument();
+  });
+});
+
+/**
+ * Tipo da release ao lado da versão: correção, novidades ou atualização geral.
+ * Vem da marca `<!-- release-kind: … -->` do texto da release
+ * (.github/scripts/release-kind.mjs); a marca e o selo do GitHub nunca
+ * aparecem como texto nas notas.
+ */
+describe("tipo da atualização", () => {
+  const body = (kind: string, badge: string) =>
+    [`<!-- release-kind: ${kind} -->`, badge, "", "## What's Changed", "- Fixed: crash on start", "", "## Contributors", "[@a](https://github.com/a)"].join(
+      "\n"
+    );
+
+  beforeEach(async () => {
+    await i18n.changeLanguage(DEFAULT_LANGUAGE);
+    resetTauriMocks();
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: false, json: async () => ({}) })));
+  });
+
+  afterEach(async () => {
+    cleanup();
+    vi.unstubAllGlobals();
+    await i18n.changeLanguage(DEFAULT_LANGUAGE);
+  });
+
+  it("mostra a versão e o selo de correção, sem a marca nem o selo do GitHub no texto", async () => {
+    setStore({ updateDialogOpen: true, updateInfo: { ...INFO, body: body("fix", "**🩹 Hotfix**") } });
+    render(<UpdateDialog />);
+    expect(screen.getByText("v0.1.7")).toBeInTheDocument();
+    expect(screen.getByText("Fix")).toHaveAttribute("data-release-kind", "fix");
+    await screen.findByText("Fixed: crash on start");
+    expect(screen.queryByText(/Hotfix|release-kind/)).not.toBeInTheDocument();
+  });
+
+  it("novidades e atualização geral têm selos próprios", () => {
+    setStore({ updateDialogOpen: true, updateInfo: { ...INFO, body: body("feature", "**✨ New features**") } });
+    const view = render(<UpdateDialog />);
+    expect(screen.getByText("New features")).toHaveAttribute("data-release-kind", "feature");
+    view.unmount();
+
+    setStore({ updateDialogOpen: true, updateInfo: { ...INFO, body: body("mixed", "**📦 General update**") } });
+    render(<UpdateDialog />);
+    expect(screen.getByText("General update")).toHaveAttribute("data-release-kind", "mixed");
+  });
+
+  it("lê o tipo do texto final da release quando o do manifesto não tem", async () => {
+    const remote = body("fix", "**🩹 Hotfix**");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) =>
+        /releases\/tags\//.test(url) ? { ok: true, json: async () => ({ body: remote }) } : { ok: false, json: async () => ({}) }
+      )
+    );
+    setStore({ updateDialogOpen: true, updateInfo: { ...INFO, body: "Channel: Beta" } });
+    render(<UpdateDialog />);
+    expect(await screen.findByText("Fix")).toHaveAttribute("data-release-kind", "fix");
+  });
+
+  it("release sem tipo não tem selo", () => {
+    setStore({ updateDialogOpen: true, updateInfo: INFO });
+    render(<UpdateDialog />);
+    expect(screen.getByText("v0.1.7")).toBeInTheDocument();
+    expect(document.querySelector("[data-release-kind]")).toBeNull();
+  });
+
+  it("fala português", async () => {
+    await i18n.changeLanguage("pt");
+    setStore({ updateDialogOpen: true, updateInfo: { ...INFO, body: body("fix", "**🩹 Hotfix**") } });
+    render(<UpdateDialog />);
+    expect(screen.getByText("Correção")).toBeInTheDocument();
+  });
+});
+
+describe("notas da atualização — detalhes técnicos", () => {
+  it("escondem o bloco recolhido de detalhes técnicos e ficam com a lista simples", () => {
+    const body = [
+      "## What's Changed",
+      "- New menu on the left",
+      "",
+      "<details>",
+      "<summary>Technical details</summary>",
+      "",
+      "* Sidebar navigation by @luanmacea in #16",
+      "",
+      "</details>",
+      "",
+      "## Contributors",
+      "[@luanmacea](https://github.com/luanmacea)",
+    ].join("\n");
+    const notes = notesForUpdateDialog(body);
+    expect(notes).toMatch(/New menu on the left/);
+    expect(notes).not.toMatch(/Technical details|in #16|<details>/);
+    expect(notes).toMatch(/## Contributors/);
+  });
+});

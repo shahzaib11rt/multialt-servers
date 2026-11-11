@@ -1,0 +1,2199 @@
+import "@testing-library/jest-dom/vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { act, cleanup, fireEvent, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+
+vi.mock("../../store", async () => (await import("../../test-utils/renderWithStore")).storeModuleMock());
+vi.mock("@tauri-apps/api/core", async () => (await import("../../test-utils/tauriMocks")).tauriCoreMock());
+vi.mock("@tauri-apps/api/event", async () => (await import("../../test-utils/tauriMocks")).tauriEventMock());
+vi.mock("../../hooks/usePrompt", async () => (await import("../../test-utils/promptMocks")).promptModuleMock());
+
+import { SessionPanel } from "./SessionPanel";
+import {
+  makeAccount,
+  makeBottingStatus,
+  makePlatformCapabilities,
+  renderWithStore,
+  setStore,
+} from "../../test-utils/renderWithStore";
+import i18n from "../../i18n";
+import { confirmMock, promptAnswers, promptMock, resetPromptMocks } from "../../test-utils/promptMocks";
+import { emitTauriEvent, invokeMock, resetTauriMocks, setInvokeMap } from "../../test-utils/tauriMocks";
+import { clearGameIdentityCache } from "../../hooks/useGameIdentity";
+import type {
+  Account,
+  AutoReconnectEntry,
+  ClientDrop,
+  ClientHealth,
+  ClosedClient,
+  CurrentSession,
+  FriendLinkState,
+  FollowUserState,
+  LaunchQueueEntry,
+  LaunchQueuePayload,
+  LaunchQueueState,
+  UnidentifiedClient,
+  UnidentifiedReason,
+} from "../../types";
+import type { StoreValue } from "../../store";
+
+const ACCOUNTS = [
+  makeAccount({ UserID: 1, Username: "alpha" }),
+  makeAccount({ UserID: 2, Username: "bravo", Alias: "Bravo Alt" }),
+  makeAccount({ UserID: 3, Username: "charlie" }),
+];
+
+function entry(userId: number, state: LaunchQueueState, error: string | null = null): LaunchQueueEntry {
+  return { userId, state, error, updatedAtMs: 1_700_000_000_000 };
+}
+
+function queue(entries: LaunchQueueEntry[], active = true): LaunchQueuePayload {
+  return { entries, active, placeId: 5315046213, jobId: "" };
+}
+
+/**
+ * A store é substituída por um mock, então as ações são reimplementadas aqui
+ * exatamente como em `store.tsx`. Assim os testes travam o **contrato com o
+ * backend** (nome do comando e argumentos que chegam ao `invoke`) e não apenas
+ * o fato de o componente ter chamado a store.
+ */
+function storeActions(): Partial<StoreValue> {
+  return {
+    cancelAccountLaunch: vi.fn(
+      async (userId: number) => (await invokeMock("cancel_account_launch", { userId })) as boolean
+    ),
+    stopLaunchQueue: vi.fn(async () => (await invokeMock("stop_launch_queue")) as number),
+    focusRobloxClient: vi.fn(
+      async (userId: number) => (await invokeMock("focus_roblox_window", { userId })) as boolean
+    ),
+    identifyExternalClient: vi.fn(
+      async (pid: number, userId: number) =>
+        (await invokeMock("identify_external_client", { pid, userId })) as boolean
+    ),
+    focusClientWindow: vi.fn(
+      async (pid: number) => (await invokeMock("focus_client_window", { pid })) as boolean
+    ),
+    closeRobloxClients: vi.fn(async (userIds: number[]) => {
+      let closed = 0;
+      for (const userId of userIds) {
+        if (await invokeMock("cmd_kill_roblox", { userId })) closed += 1;
+      }
+      return closed;
+    }),
+  };
+}
+
+function renderPanel(overrides: Partial<StoreValue> = {}) {
+  return renderWithStore(<SessionPanel />, {
+    accounts: ACCOUNTS,
+    ...storeActions(),
+    ...overrides,
+  });
+}
+
+/** Chamadas do `invoke` mockado para um comando. */
+function callsFor(cmd: string) {
+  return invokeMock.mock.calls.filter((c) => c[0] === cmd);
+}
+
+beforeEach(() => {
+  resetTauriMocks();
+  resetPromptMocks();
+  setInvokeMap({
+    cancel_account_launch: true,
+    stop_launch_queue: 3,
+    focus_roblox_window: true,
+    cmd_kill_roblox: true,
+    identify_external_client: true,
+    focus_client_window: true,
+  });
+});
+
+function unidentified(
+  pid: number,
+  reason: UnidentifiedReason,
+  userId: number | null = null
+): UnidentifiedClient {
+  return { pid, reason, userId, placeId: null, jobId: null, startedAtMs: 1_700_000_000_000 };
+}
+
+afterEach(cleanup);
+
+describe("SessionPanel — rendering", () => {
+  /** Clique em Entrar: antes da fila existir, a Sessão já diz o que está acontecendo. */
+  it("shows the launch preparation before the queue exists", () => {
+    renderPanel({ launchQueue: null, launchPreparing: { userIds: [1, 2], step: "server" } });
+    expect(screen.getByTestId("launch-preparing")).toHaveTextContent(
+      "Preparing to open 2 account(s): choosing the best server..."
+    );
+  });
+
+  it("shows nothing about preparation when no launch is being prepared", () => {
+    renderPanel({ launchQueue: null, launchPreparing: null });
+    expect(screen.queryByTestId("launch-preparing")).not.toBeInTheDocument();
+  });
+
+  it("lists the launch queue and the running clients", () => {
+    renderPanel({
+      launchQueue: queue([entry(1, "launching"), entry(2, "queued"), entry(3, "done")]),
+      launchedByProgram: new Set([1, 3]),
+    });
+
+    // Fila: uma linha por conta, com o estado de cada uma.
+    expect(within(screen.getByTestId("session-queue-1")).getByText("Joining")).toBeInTheDocument();
+    expect(within(screen.getByTestId("session-queue-2")).getByText("Queued")).toBeInTheDocument();
+    expect(within(screen.getByTestId("session-queue-3")).getByText("Joined")).toBeInTheDocument();
+
+    // Em jogo: só as contas com cliente rodando.
+    expect(screen.getByTestId("session-running-1")).toBeInTheDocument();
+    expect(screen.getByTestId("session-running-3")).toBeInTheDocument();
+    expect(screen.queryByTestId("session-running-2")).not.toBeInTheDocument();
+    expect(screen.getByText("2 running")).toBeInTheDocument();
+  });
+
+  it("shows the alias and masks names when the app hides usernames", () => {
+    renderPanel({
+      launchQueue: queue([entry(2, "queued")]),
+      launchedByProgram: new Set<number>(),
+    });
+    expect(within(screen.getByTestId("session-queue-2")).getByText("Bravo Alt")).toBeInTheDocument();
+
+    cleanup();
+    renderPanel({
+      launchQueue: queue([entry(2, "queued")]),
+      launchedByProgram: new Set<number>(),
+      hideUsernames: true,
+      hiddenNameLetters: 2,
+    });
+    const row = screen.getByTestId("session-queue-2");
+    expect(within(row).queryByText("Bravo Alt")).not.toBeInTheDocument();
+    expect(within(row).getByText("Br********")).toBeInTheDocument();
+  });
+
+  it("surfaces a failed entry's backend error", () => {
+    // Fixture com frase, não com código: esta linha desenha `entry.error` cru, e
+    // o backend manda frase justamente por isso (`version_conflict_message`).
+    const erro =
+      "A Roblox client is already running on a different Roblox version. Open now: system install.";
+    renderPanel({
+      launchQueue: queue([entry(1, "failed", erro)]),
+      launchedByProgram: new Set<number>(),
+    });
+    const row = screen.getByTestId("session-queue-1");
+    expect(within(row).getByText("Failed")).toBeInTheDocument();
+    expect(within(row).getByText(erro)).toBeInTheDocument();
+  });
+
+  /**
+   * Um launch disparado com a fila rodando entra no fim dela, com o jogo dele:
+   * 3 contas no jogo A e mais 2 no jogo B ficam na mesma fila. Sem o jogo na
+   * linha, não dava para saber qual conta ia para onde.
+   */
+  it("a queue that mixes games names the game of each account", async () => {
+    clearGameIdentityCache();
+    setInvokeMap({
+      batched_get_game_info: (args: Record<string, unknown> | undefined) => {
+        const placeId = Number(args?.placeId);
+        const names: Record<number, string> = { 606849621: "Jailbreak", 920587237: "Adopt Me" };
+        return { placeId, universeId: 1, name: names[placeId] ?? null, iconUrl: null };
+      },
+    });
+    renderPanel({
+      launchQueue: queue([
+        { ...entry(1, "launching"), placeId: 606849621, jobId: "" },
+        { ...entry(2, "queued"), placeId: 606849621, jobId: "" },
+        { ...entry(3, "queued"), placeId: 920587237, jobId: "" },
+      ]),
+      launchedByProgram: new Set<number>(),
+    });
+
+    expect(await within(screen.getByTestId("session-queue-1")).findByText("Jailbreak")).toBeInTheDocument();
+    expect(await within(screen.getByTestId("session-queue-3")).findByText("Adopt Me")).toBeInTheDocument();
+    // E o "Queued" continua lá: o jogo não toma o lugar do estado.
+    expect(within(screen.getByTestId("session-queue-3")).getByText("Queued")).toBeInTheDocument();
+  });
+
+  it("a queue with a single game does not repeat it on every row", async () => {
+    clearGameIdentityCache();
+    setInvokeMap({
+      batched_get_game_info: () => ({ placeId: 606849621, universeId: 1, name: "Jailbreak", iconUrl: null }),
+    });
+    renderPanel({
+      launchQueue: queue([
+        { ...entry(1, "launching"), placeId: 606849621, jobId: "" },
+        { ...entry(2, "queued"), placeId: 606849621, jobId: "" },
+      ]),
+      launchedByProgram: new Set<number>(),
+    });
+    // Um jogo só: o nome em cada linha seria a mesma palavra repetida.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(within(screen.getByTestId("session-queue-1")).queryByText("Jailbreak")).not.toBeInTheDocument();
+  });
+
+  /** Fila vazia é só o cabeçalho: uma caixa vazia empurrava o "Em jogo" para baixo. */
+  it("an idle queue collapses to its header", () => {
+    renderPanel({ launchQueue: null, launchedByProgram: new Set<number>() });
+    const joining = document.querySelector("[data-tour='session-joining']") as HTMLElement;
+    expect(within(joining).getByText("Nothing waiting")).toBeInTheDocument();
+    expect(within(joining).queryByRole("button", { name: /Stop queue/ })).not.toBeInTheDocument();
+    expect(within(joining).queryByRole("list")).not.toBeInTheDocument();
+    expect(
+      screen.getByText("No Roblox client is running. Accounts you launch show up here.")
+    ).toBeInTheDocument();
+  });
+
+  it("disables Stop queue when every entry already finished", () => {
+    renderPanel({ launchQueue: queue([entry(1, "done")]), launchedByProgram: new Set<number>() });
+    expect(screen.getByRole("button", { name: /Stop queue/ })).toBeDisabled();
+  });
+
+  /** Embutido em outro lugar, o painel guarda a rolagem própria de cada lista. */
+  it("keeps each list in its own scroll box unless told otherwise", () => {
+    renderPanel({ launchQueue: queue([entry(1, "queued")]), launchedByProgram: new Set([1, 2]) });
+    const inGame = document.querySelector("[data-tour='session-in-game']") as HTMLElement;
+    expect(inGame.querySelector("[class*='max-h-']")).not.toBeNull();
+  });
+});
+
+describe("SessionPanel — queue actions", () => {
+  it("cancels only the clicked account", async () => {
+    const user = userEvent.setup();
+    renderPanel({
+      launchQueue: queue([entry(1, "queued"), entry(2, "queued")]),
+      launchedByProgram: new Set<number>(),
+    });
+
+    await user.click(within(screen.getByTestId("session-queue-2")).getByRole("button"));
+
+    await waitFor(() => expect(callsFor("cancel_account_launch")).toHaveLength(1));
+    expect(callsFor("cancel_account_launch")[0][1]).toEqual({ userId: 2 });
+  });
+
+  it("never closes a client when cancelling (cancel !== kill)", async () => {
+    const user = userEvent.setup();
+    // Conta 1 já está com cliente aberto E ainda na fila: cancelar não pode
+    // encostar nesse cliente.
+    renderPanel({
+      launchQueue: queue([entry(1, "launching")]),
+      launchedByProgram: new Set([1]),
+    });
+
+    await user.click(within(screen.getByTestId("session-queue-1")).getByRole("button"));
+    await waitFor(() => expect(callsFor("cancel_account_launch")).toHaveLength(1));
+
+    expect(callsFor("cmd_kill_roblox")).toHaveLength(0);
+    expect(callsFor("cmd_kill_all_roblox")).toHaveLength(0);
+  });
+
+  it("offers no cancel button for finished entries", () => {
+    renderPanel({
+      launchQueue: queue([entry(1, "done"), entry(2, "failed", "boom"), entry(3, "cancelled")]),
+      launchedByProgram: new Set<number>(),
+    });
+    for (const id of [1, 2, 3]) {
+      expect(within(screen.getByTestId(`session-queue-${id}`)).queryByRole("button")).toBeNull();
+    }
+  });
+
+  it("stops the whole queue from the header", async () => {
+    const user = userEvent.setup();
+    renderPanel({
+      launchQueue: queue([entry(1, "queued"), entry(2, "queued")]),
+      launchedByProgram: new Set<number>(),
+    });
+
+    await user.click(screen.getByRole("button", { name: /Stop queue/ }));
+
+    await waitFor(() => expect(callsFor("stop_launch_queue")).toHaveLength(1));
+    expect(callsFor("cmd_kill_roblox")).toHaveLength(0);
+  });
+
+  it("shows a backend failure instead of swallowing it", async () => {
+    const user = userEvent.setup();
+    setInvokeMap({
+      stop_launch_queue: () => {
+        throw new Error("queue is gone");
+      },
+    });
+    renderPanel({
+      launchQueue: queue([entry(1, "queued")]),
+      launchedByProgram: new Set<number>(),
+    });
+
+    await user.click(screen.getByRole("button", { name: /Stop queue/ }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("queue is gone");
+  });
+});
+
+describe("SessionPanel — running clients", () => {
+  it("focuses the clicked client's window", async () => {
+    const user = userEvent.setup();
+    renderPanel({ launchQueue: null, launchedByProgram: new Set([1, 3]) });
+
+    await user.click(within(screen.getByTestId("session-running-3")).getByRole("button", { name: "Focus" }));
+
+    await waitFor(() => expect(callsFor("focus_roblox_window")).toHaveLength(1));
+    expect(callsFor("focus_roblox_window")[0][1]).toEqual({ userId: 3 });
+  });
+
+  it("reports a window that could not be raised", async () => {
+    const user = userEvent.setup();
+    setInvokeMap({ focus_roblox_window: false });
+    renderPanel({ launchQueue: null, launchedByProgram: new Set([1]) });
+
+    await user.click(within(screen.getByTestId("session-running-1")).getByRole("button", { name: "Focus" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Could not bring that Roblox window to the front."
+    );
+  });
+
+  /**
+   * O "Close" da linha ficava colado no "Focus" e fechava no primeiro clique.
+   * Agora o primeiro clique só arma ("Close?"); o segundo fecha aquela conta.
+   */
+  it("a row's Close asks inline first, then closes only that client", async () => {
+    const user = userEvent.setup();
+    renderPanel({ launchQueue: null, launchedByProgram: new Set([1, 2]) });
+    const row = within(screen.getByTestId("session-running-2"));
+
+    await user.click(row.getByRole("button", { name: "Close" }));
+    expect(callsFor("cmd_kill_roblox")).toHaveLength(0);
+    await user.click(row.getByRole("button", { name: "Close?" }));
+
+    await waitFor(() => expect(callsFor("cmd_kill_roblox")).toHaveLength(1));
+    expect(callsFor("cmd_kill_roblox")[0][1]).toEqual({ userId: 2 });
+    expect(confirmMock).not.toHaveBeenCalled();
+  });
+
+  it("the armed Close goes back on Escape, closing nothing", async () => {
+    const user = userEvent.setup();
+    renderPanel({ launchQueue: null, launchedByProgram: new Set([1]) });
+    const row = within(screen.getByTestId("session-running-1"));
+    await user.click(row.getByRole("button", { name: "Close" }));
+    await user.keyboard("{Escape}");
+    expect(row.getByRole("button", { name: "Close" })).toBeInTheDocument();
+    expect(callsFor("cmd_kill_roblox")).toHaveLength(0);
+  });
+
+  it("the armed Close goes back by itself after a few seconds", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+      renderPanel({ launchQueue: null, launchedByProgram: new Set([1]) });
+      const row = within(screen.getByTestId("session-running-1"));
+      await user.click(row.getByRole("button", { name: "Close" }));
+      await act(async () => {
+        vi.advanceTimersByTime(5_000);
+      });
+      expect(row.getByRole("button", { name: "Close" })).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("closes the selected clients after one confirmation that names them", async () => {
+    const user = userEvent.setup();
+    promptAnswers.confirm = true;
+    renderPanel({ launchQueue: null, launchedByProgram: new Set([1, 2, 3]) });
+
+    await user.click(screen.getByRole("checkbox", { name: "Select alpha" }));
+    await user.click(screen.getByRole("checkbox", { name: "Select Bravo Alt" }));
+    await user.click(screen.getByRole("checkbox", { name: "Select charlie" }));
+
+    await user.click(screen.getByRole("button", { name: "Close selected (3)" }));
+
+    await waitFor(() => expect(callsFor("cmd_kill_roblox")).toHaveLength(3));
+    expect(confirmMock).toHaveBeenCalledTimes(1);
+    const [message, destructive, options] = confirmMock.mock.calls[0];
+    expect(message).toBe("Close the Roblox client of these accounts?");
+    expect(destructive).toBe(true);
+    expect(options?.confirmLabel).toBe("Close 3 clients");
+    expect(options?.details).toEqual(["alpha", "Bravo Alt", "charlie"]);
+    expect(callsFor("cmd_kill_roblox").map((c) => c[1])).toEqual([
+      { userId: 1 },
+      { userId: 2 },
+      { userId: 3 },
+    ]);
+  });
+
+  it("closes nothing when the confirmation is declined", async () => {
+    const user = userEvent.setup();
+    promptAnswers.confirm = false;
+    renderPanel({ launchQueue: null, launchedByProgram: new Set([1, 2]) });
+
+    await user.click(screen.getByRole("checkbox", { name: "Select all running clients" }));
+    await user.click(screen.getByRole("button", { name: "Close selected (2)" }));
+
+    await waitFor(() => expect(confirmMock).toHaveBeenCalledTimes(1));
+    expect(callsFor("cmd_kill_roblox")).toHaveLength(0);
+  });
+});
+
+/**
+ * Marcar contas não pode empurrar as linhas: a faixa de lote entrava entre o
+ * cabeçalho e a lista e descia tudo ~76 px no primeiro clique. Agora é uma
+ * barra presa ao pé do cartão. Shift+clique marca um intervalo, como na lista
+ * de contas.
+ */
+describe("SessionPanel — seleção em lote", () => {
+  const FIVE = [...ACCOUNTS, makeAccount({ UserID: 4, Username: "delta" }), makeAccount({ UserID: 5, Username: "echo" })];
+
+  function renderFive(overrides: Partial<StoreValue> = {}) {
+    setInvokeMap({ get_nexus_accounts: [] });
+    return renderWithStore(<SessionPanel />, {
+      accounts: FIVE,
+      launchedByProgram: new Set([1, 2, 3, 4, 5]),
+      ...storeActions(),
+      ...overrides,
+    });
+  }
+
+  it("shows the bulk bar under the rows, pinned to the bottom, so nothing above them moves", async () => {
+    renderFive();
+    const firstRow = screen.getByTestId("session-running-1");
+    const before = firstRow.previousElementSibling;
+    await userEvent.click(screen.getByRole("checkbox", { name: "Select alpha" }));
+    const bar = screen.getByTestId("session-bulk-bar");
+    expect(bar.className).toMatch(/sticky/);
+    expect(bar.className).toMatch(/bottom-0/);
+    expect(screen.getByTestId("session-running-5").compareDocumentPosition(bar) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // Nada entrou entre o cabeçalho e a primeira linha.
+    expect(firstRow.previousElementSibling).toBe(before);
+    expect(within(bar).getByText("1 selected")).toBeInTheDocument();
+  });
+
+  it("shift-click selects the range from the last clicked row", async () => {
+    const user = userEvent.setup();
+    renderFive();
+    await user.click(screen.getByRole("checkbox", { name: "Select Bravo Alt" }));
+    await user.keyboard("{Shift>}");
+    await user.click(screen.getByRole("checkbox", { name: "Select delta" }));
+    await user.keyboard("{/Shift}");
+    expect(screen.getByRole("checkbox", { name: "Select alpha" })).not.toBeChecked();
+    for (const name of ["Bravo Alt", "charlie", "delta"]) {
+      expect(screen.getByRole("checkbox", { name: `Select ${name}` })).toBeChecked();
+    }
+    expect(screen.getByRole("checkbox", { name: "Select echo" })).not.toBeChecked();
+
+    // Shift+clique numa marcada desmarca o intervalo.
+    await user.keyboard("{Shift>}");
+    await user.click(screen.getByRole("checkbox", { name: "Select charlie" }));
+    await user.keyboard("{/Shift}");
+    expect(screen.getByRole("checkbox", { name: "Select charlie" })).not.toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Select delta" })).not.toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Select Bravo Alt" })).toBeChecked();
+  });
+
+  it("Ctrl-click toggles one row and dragging over the rows selects every row it passes", () => {
+    renderFive();
+    const box = (name: string) => screen.getByRole("checkbox", { name: `Select ${name}` });
+    fireEvent.click(box("alpha"), { ctrlKey: true });
+    fireEvent.click(box("echo"), { ctrlKey: true });
+    expect(box("alpha")).toBeChecked();
+    expect(box("echo")).toBeChecked();
+    expect(box("charlie")).not.toBeChecked();
+
+    fireEvent.mouseDown(box("Bravo Alt"), { button: 0 });
+    fireEvent.mouseMove(screen.getByTestId("session-running-3"));
+    fireEvent.mouseMove(screen.getByTestId("session-running-4"));
+    fireEvent.mouseUp(screen.getByTestId("session-running-4"));
+    for (const name of ["Bravo Alt", "charlie", "delta"]) expect(box(name)).toBeChecked();
+    // The click the browser sends after a drag is not a second toggle.
+    fireEvent.click(box("Bravo Alt"));
+    expect(box("Bravo Alt")).toBeChecked();
+  });
+
+  it("clears the selection from the bar", async () => {
+    renderFive();
+    await userEvent.click(screen.getByRole("checkbox", { name: "Select all running clients" }));
+    await userEvent.click(within(screen.getByTestId("session-bulk-bar")).getByRole("button", { name: "Clear selection" }));
+    expect(screen.queryByTestId("session-bulk-bar")).not.toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: "Select alpha" })).not.toBeChecked();
+  });
+});
+
+describe("SessionPanel — live updates", () => {
+  it("follows the store's queue state without a reload", async () => {
+    // O evento `launch-queue` é ouvido pela store; o painel só reflete o
+    // estado. Re-renderizar com o payload novo é o que o listener faz.
+    const { rerender } = renderPanel({
+      launchQueue: queue([entry(1, "queued"), entry(2, "queued")]),
+      launchedByProgram: new Set<number>(),
+    });
+    expect(within(screen.getByTestId("session-queue-1")).getByText("Queued")).toBeInTheDocument();
+
+    setStore({
+      accounts: ACCOUNTS,
+      ...storeActions(),
+      launchQueue: queue([entry(1, "done"), entry(2, "launching")]),
+      launchedByProgram: new Set([1]),
+    });
+    rerender(<SessionPanel />);
+
+    await waitFor(() =>
+      expect(within(screen.getByTestId("session-queue-1")).getByText("Joined")).toBeInTheDocument()
+    );
+    expect(within(screen.getByTestId("session-queue-2")).getByText("Joining")).toBeInTheDocument();
+    expect(screen.getByTestId("session-running-1")).toBeInTheDocument();
+  });
+
+  it("drops a client that stopped running from the selection", async () => {
+    const user = userEvent.setup();
+    const { rerender } = renderPanel({ launchQueue: null, launchedByProgram: new Set([1, 2]) });
+
+    await user.click(screen.getByRole("checkbox", { name: "Select all running clients" }));
+    expect(screen.getByRole("button", { name: "Close selected (2)" })).toBeInTheDocument();
+
+    // O polling deixa de ver a conta 2: ela some da lista e do lote.
+    setStore({
+      accounts: ACCOUNTS,
+      ...storeActions(),
+      launchQueue: null,
+      launchedByProgram: new Set([1]),
+    });
+    rerender(<SessionPanel />);
+
+    expect(screen.queryByTestId("session-running-2")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Close selected (1)" })).toBeInTheDocument();
+  });
+});
+
+/**
+ * Fechar as contas em jogo. "Close all clients (n)" no cabeçalho vale para
+ * **todas as que estão na lista** — nunca para clientes fora dela
+ * (`closeRobloxClients`, não o `killAllRobloxProcesses`) — e sempre pergunta,
+ * listando as contas e dizendo quais foram abertas pelo site. O botão do
+ * diálogo diz quantos fecha.
+ */
+describe("SessionPanel — fechar contas", () => {
+  it("Close all closes every account in the list after a confirmation", async () => {
+    const user = userEvent.setup();
+    promptAnswers.confirm = true;
+    const { store } = renderPanel({ launchQueue: null, launchedByProgram: new Set([1, 2]) });
+
+    await user.click(screen.getByRole("button", { name: "Close all clients (2)" }));
+
+    await waitFor(() => expect(callsFor("cmd_kill_roblox")).toHaveLength(2));
+    expect(confirmMock).toHaveBeenCalledTimes(1);
+    expect(confirmMock.mock.calls[0][2]?.confirmLabel).toBe("Close 2 clients");
+    expect(store.killAllRobloxProcesses).not.toHaveBeenCalled();
+  });
+
+  it("Close all still means all, even with some rows ticked", async () => {
+    const user = userEvent.setup();
+    promptAnswers.confirm = true;
+    renderPanel({ launchQueue: null, launchedByProgram: new Set([1, 2, 3]) });
+    await user.click(screen.getByRole("checkbox", { name: "Select alpha" }));
+    await user.click(screen.getByRole("button", { name: "Close all clients (3)" }));
+    await waitFor(() => expect(callsFor("cmd_kill_roblox")).toHaveLength(3));
+  });
+
+  it("recusada a confirmação, nada fecha", async () => {
+    const user = userEvent.setup();
+    promptAnswers.confirm = false;
+    renderPanel({ launchQueue: null, launchedByProgram: new Set([1, 2]) });
+
+    await user.click(screen.getByRole("button", { name: "Close all clients (2)" }));
+
+    await waitFor(() => expect(confirmMock).toHaveBeenCalledTimes(1));
+    expect(callsFor("cmd_kill_roblox")).toHaveLength(0);
+  });
+
+  it("asks even for a single client, in the singular", async () => {
+    const user = userEvent.setup();
+    promptAnswers.confirm = true;
+    renderPanel({ launchQueue: null, launchedByProgram: new Set([3]) });
+
+    await user.click(screen.getByRole("button", { name: "Close all clients (1)" }));
+
+    await waitFor(() => expect(callsFor("cmd_kill_roblox")).toHaveLength(1));
+    expect(confirmMock.mock.calls[0][2]?.confirmLabel).toBe("Close 1 client");
+  });
+
+  it("lists the first five accounts and how many more, and flags clients opened from the website", async () => {
+    const user = userEvent.setup();
+    promptAnswers.confirm = false;
+    const many = Array.from({ length: 7 }, (_, i) => makeAccount({ UserID: 10 + i, Username: `acc${i}` }));
+    renderWithStore(<SessionPanel />, {
+      accounts: many,
+      launchedByProgram: new Set(many.map((a) => a.UserID)),
+      adoptedClients: new Set([11]),
+      ...storeActions(),
+    });
+    await user.click(screen.getByRole("button", { name: "Close all clients (7)" }));
+    const options = confirmMock.mock.calls[0][2];
+    expect(options?.details).toEqual([
+      "acc0",
+      "acc1 (opened from the website)",
+      "acc2",
+      "acc3",
+      "acc4",
+      "and 2 more",
+    ]);
+    expect(options?.note).toBe("Includes 1 client opened from the Roblox website.");
+  });
+
+  it("não aparece sem cliente rodando", () => {
+    renderPanel({ launchQueue: null, launchedByProgram: new Set() });
+    expect(screen.queryByRole("button", { name: /Close all clients/ })).not.toBeInTheDocument();
+  });
+});
+
+/**
+ * O botão de Auto Rejoin daqui ligava o ciclo na hora, sem tela: quem clicava
+ * não via o tempo do ciclo, nem as contas main, nem onde parar. Agora ele abre o
+ * Modo AFK com as contas em jogo — o Start de lá é que adota, sem fechar nada.
+ */
+describe("SessionPanel — Modo AFK com as contas em jogo", () => {
+  function comRodando(overrides: Partial<StoreValue> = {}) {
+    return renderPanel({
+      launchedByProgram: new Set([1, 2]),
+      launchQueue: queue([]),
+      ...overrides,
+    });
+  }
+
+  it("abre o Modo AFK com as contas marcadas, sem ligar nada nem fechar cliente", async () => {
+    const { store } = comRodando({ launchedByProgram: new Set([1, 2, 3]) });
+
+    await userEvent.click(screen.getByRole("checkbox", { name: "Select alpha" }));
+    await userEvent.click(screen.getByRole("checkbox", { name: "Select charlie" }));
+    await userEvent.click(screen.getByRole("button", { name: /AFK Mode/ }));
+
+    expect(store.openAfkMode).toHaveBeenCalledWith({
+      tab: "clicks",
+      targetUserIds: [1, 3],
+      adoptRunning: true,
+    });
+    expect(store.adoptRunningIntoBotting).not.toHaveBeenCalled();
+    expect(store.startBottingMode).not.toHaveBeenCalled();
+    expect(invokeMock).not.toHaveBeenCalledWith("cmd_kill_roblox", expect.anything());
+  });
+
+  it("sem marcar ninguém, leva todas as que estão em jogo", async () => {
+    const { store } = comRodando();
+
+    await userEvent.click(screen.getByRole("button", { name: /AFK Mode/ }));
+
+    expect(store.openAfkMode).toHaveBeenCalledWith({
+      tab: "clicks",
+      targetUserIds: [1, 2],
+      adoptRunning: true,
+    });
+  });
+
+  it("com só os cliques AFK ligados, abre na aba deles", async () => {
+    const { store } = comRodando({
+      afkStatus: {
+        active: true,
+        startedAtMs: 1,
+        intervalSeconds: 600,
+        key: "Space",
+        mode: "key",
+        clickX: 50,
+        clickY: 50,
+        accounts: [],
+      },
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: /AFK Mode/ }));
+
+    expect(store.openAfkMode).toHaveBeenCalledWith(expect.objectContaining({ tab: "clicks" }));
+  });
+
+  /** Os cliques AFK são o padrão (pedido do dono, 03/10/2026); o Auto Rejoin só
+   * abre direto quando é ele que está rodando. */
+  it("com só o Auto Rejoin ligado, abre na aba dele", async () => {
+    const { store } = comRodando({ bottingStatus: makeBottingStatus({ active: true, userIds: [1, 2] }) });
+
+    await userEvent.click(screen.getByRole("button", { name: /AFK Mode/ }));
+
+    expect(store.openAfkMode).toHaveBeenCalledWith(expect.objectContaining({ tab: "rejoin" }));
+  });
+
+  it("não oferece o botão quando não há cliente rodando", () => {
+    renderPanel({ launchedByProgram: new Set(), launchQueue: queue([]) });
+    expect(screen.queryByRole("button", { name: /AFK Mode/ })).not.toBeInTheDocument();
+  });
+});
+
+/**
+ * Make Friends não tinha como ser acompanhado: o progresso era `{phase, done,
+ * total}` num `useState` de dois componentes, e na fase de envio o `done`
+ * contava **pares**. Agora o painel mostra conta por conta, no mesmo lugar em
+ * que se acompanha a fila de launch.
+ */
+describe("SessionPanel — Make Friends", () => {
+  function friendLink(overrides: Partial<FriendLinkState> = {}): FriendLinkState {
+    return {
+      active: true,
+      phase: "linking",
+      processed: 1,
+      total: 3,
+      mode: "star",
+      mainUserId: 1,
+      accounts: [
+        { userId: 1, state: "processing", error: null },
+        { userId: 2, state: "done", error: null },
+        { userId: 3, state: "pending", error: null },
+      ],
+      ...overrides,
+    };
+  }
+
+  it("não ocupa espaço no painel enquanto ninguém rodou Make Friends", () => {
+    renderPanel({ launchQueue: queue([entry(1, "queued")]) });
+    expect(screen.queryByTestId("friend-link-panel")).not.toBeInTheDocument();
+  });
+
+  it("diz quantas contas já foram processadas e o estado de cada uma", () => {
+    renderPanel({ friendLinkState: friendLink() });
+
+    const painel = within(screen.getByTestId("friend-link-panel"));
+    expect(painel.getByText("1 / 3 accounts processed")).toBeInTheDocument();
+    expect(painel.getByText("Sending friend requests")).toBeInTheDocument();
+
+    expect(within(screen.getByTestId("friend-link-1")).getByText("Processing")).toBeInTheDocument();
+    expect(within(screen.getByTestId("friend-link-2")).getByText("Linked")).toBeInTheDocument();
+    expect(within(screen.getByTestId("friend-link-3")).getByText("Waiting")).toBeInTheDocument();
+  });
+
+  it("marca qual é a conta principal do modo star", () => {
+    renderPanel({ friendLinkState: friendLink() });
+    expect(within(screen.getByTestId("friend-link-1")).getByText("main")).toBeInTheDocument();
+    expect(within(screen.getByTestId("friend-link-2")).queryByText("main")).not.toBeInTheDocument();
+  });
+
+  it("mostra o erro na conta que falhou, e não num texto agregado", () => {
+    renderPanel({
+      friendLinkState: friendLink({
+        accounts: [
+          { userId: 1, state: "failed", error: "cookie inválido" },
+          { userId: 2, state: "done", error: null },
+          { userId: 3, state: "done", error: null },
+        ],
+      }),
+    });
+
+    const linha = within(screen.getByTestId("friend-link-1"));
+    expect(linha.getByText("Failed")).toBeInTheDocument();
+    expect(linha.getByText("cookie inválido")).toBeInTheDocument();
+  });
+
+  it("continua mostrando o resultado depois que a operação termina", () => {
+    renderPanel({
+      friendLinkState: friendLink({ active: false, phase: "done", processed: 3 }),
+    });
+
+    const painel = within(screen.getByTestId("friend-link-panel"));
+    expect(painel.getByText("3 / 3 accounts processed")).toBeInTheDocument();
+    expect(painel.getByText("Finished")).toBeInTheDocument();
+  });
+
+  it("usa o alias mascarado, como o resto do painel", () => {
+    renderPanel({
+      friendLinkState: friendLink(),
+      hideUsernames: true,
+      hiddenNameLetters: 2,
+    });
+    expect(within(screen.getByTestId("friend-link-2")).getByText("Br********")).toBeInTheDocument();
+  });
+});
+
+/** "Follow a user": o lote aparece aqui conta por conta, como o Make Friends. */
+describe("SessionPanel — Follow a user", () => {
+  function followRun(overrides: Partial<FollowUserState> = {}): FollowUserState {
+    return {
+      active: true,
+      processed: 2,
+      total: 3,
+      targetUserId: 9999,
+      targetName: "starplayer",
+      accounts: [
+        { userId: 1, state: "followed", error: null },
+        { userId: 2, state: "already", error: null },
+        { userId: 3, state: "failed", error: "status 429" },
+      ],
+      ...overrides,
+    };
+  }
+
+  it("não aparece antes do primeiro lote", () => {
+    renderPanel({ followUserState: followRun({ total: 0, accounts: [] }) });
+    expect(screen.queryByTestId("follow-user-panel")).not.toBeInTheDocument();
+  });
+
+  it("diz quem está sendo seguido, o progresso e o estado de cada conta", () => {
+    renderPanel({ followUserState: followRun() });
+
+    const painel = within(screen.getByTestId("follow-user-panel"));
+    expect(painel.getByText("@starplayer")).toBeInTheDocument();
+    expect(painel.getByText("2 / 3 accounts processed")).toBeInTheDocument();
+    expect(within(screen.getByTestId("follow-user-1")).getByText("Followed")).toBeInTheDocument();
+    expect(within(screen.getByTestId("follow-user-2")).getByText("Already following")).toBeInTheDocument();
+    const falhou = within(screen.getByTestId("follow-user-3"));
+    expect(falhou.getByText("Failed")).toBeInTheDocument();
+    expect(falhou.getByText("status 429")).toBeInTheDocument();
+  });
+
+  /** Seguir é pelo navegador da conta desde 14/10/2026: a janela pede a pessoa. */
+  it("diz para terminar no navegador quando a janela pede a pessoa", () => {
+    renderPanel({
+      followUserState: followRun({
+        accounts: [{ userId: 1, state: "browser", error: null }],
+        total: 1,
+        processed: 0,
+      }),
+    });
+    expect(within(screen.getByTestId("follow-user-1")).getByText("Finish in the browser")).toBeInTheDocument();
+  });
+
+  it("alvo que é conta do app usa o nome mascarado", () => {
+    renderPanel({
+      followUserState: followRun({ targetUserId: 2, targetName: "bravo" }),
+      hideUsernames: true,
+      hiddenNameLetters: 2,
+    });
+    const painel = within(screen.getByTestId("follow-user-panel"));
+    expect(painel.queryByText("@bravo")).not.toBeInTheDocument();
+    expect(painel.getAllByText("Br********").length).toBeGreaterThan(0);
+  });
+});
+
+describe("SessionPanel — clientes abertos fora do app", () => {
+  it("marks a running client that was opened from the website", () => {
+    renderPanel({
+      launchedByProgram: new Set([1, 3]),
+      adoptedClients: new Set([3]),
+    });
+    expect(within(screen.getByTestId("session-running-3")).getByText("Opened outside the app")).toBeInTheDocument();
+    expect(within(screen.getByTestId("session-running-1")).queryByText("Opened outside the app")).not.toBeInTheDocument();
+  });
+
+  it("lists unidentified clients apart from the running accounts, with why", () => {
+    renderPanel({
+      launchedByProgram: new Set([1]),
+      unidentifiedClients: [
+        unidentified(4100, "waitingForGame"),
+        unidentified(4200, "noLog"),
+        unidentified(4300, "unknownAccount", 999),
+        unidentified(4400, "accountBusy", 1),
+      ],
+    });
+
+    const waiting = screen.getByTestId("session-unidentified-4100");
+    // Em palavras simples: o que é, e o que fazer. O PID fica no tooltip.
+    expect(within(waiting).getByText("Roblox open, account unknown")).toBeInTheDocument();
+    expect(within(waiting).getByText("Roblox open, account unknown")).toHaveAttribute("title", expect.stringContaining("PID 4100"));
+    expect(within(waiting).getByText(/hasn't joined a game yet/)).toBeInTheDocument();
+    expect(within(screen.getByTestId("session-unidentified-4200")).getByText(/No Roblox log matched/)).toBeInTheDocument();
+    expect(within(screen.getByTestId("session-unidentified-4300")).getByText(/not in your list/)).toBeInTheDocument();
+    expect(within(screen.getByTestId("session-unidentified-4400")).getByText(/alpha already has a client open/)).toBeInTheDocument();
+
+    // Não entram na contagem nem no lote de fechar: só as contas.
+    expect(screen.getByText("1 running")).toBeInTheDocument();
+    expect(screen.getByText("4 unidentified")).toBeInTheDocument();
+    // Cliente não identificado nunca ganha botão de fechar.
+    expect(within(waiting).queryByRole("button", { name: /Close/ })).not.toBeInTheDocument();
+  });
+
+  it("does not show the empty state when only unidentified clients are open", () => {
+    renderPanel({ unidentifiedClients: [unidentified(4100, "noLog")] });
+    expect(
+      screen.queryByText("No Roblox client is running. Accounts you launch show up here.")
+    ).not.toBeInTheDocument();
+    expect(screen.getByTestId("session-unidentified-4100")).toBeInTheDocument();
+  });
+
+  it("Show window focuses the client by its pid", async () => {
+    const user = userEvent.setup();
+    renderPanel({ unidentifiedClients: [unidentified(4100, "noLog")] });
+
+    await user.click(
+      within(screen.getByTestId("session-unidentified-4100")).getByRole("button", { name: /Show window/ })
+    );
+    expect(callsFor("focus_client_window")).toEqual([["focus_client_window", { pid: 4100 }]]);
+  });
+
+  it("explains when the window could not be shown", async () => {
+    const user = userEvent.setup();
+    setInvokeMap({ focus_client_window: false });
+    renderPanel({ unidentifiedClients: [unidentified(4100, "noLog")] });
+
+    await user.click(screen.getByRole("button", { name: /Show window/ }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Could not bring that Roblox window to the front."
+    );
+  });
+
+  it("Identify assigns the picked account to that pid, marking accounts already in game", async () => {
+    const user = userEvent.setup();
+    renderPanel({
+      launchedByProgram: new Set([1]),
+      unidentifiedClients: [unidentified(4100, "waitingForGame")],
+    });
+    const row = screen.getByTestId("session-unidentified-4100");
+
+    await user.click(within(row).getByRole("button", { name: /Identify/ }));
+    const picker = within(row).getByRole("combobox", { name: "Account for this client" });
+    expect(within(picker).getByRole("option", { name: "alpha (already in game)" })).toBeInTheDocument();
+    expect(within(picker).getByRole("option", { name: "Bravo Alt" })).toBeInTheDocument();
+
+    // Sem escolher, confirmar não faz nada.
+    expect(within(row).getByRole("button", { name: /Confirm/ })).toBeDisabled();
+    await user.selectOptions(picker, "2");
+    await user.click(within(row).getByRole("button", { name: /Confirm/ }));
+
+    expect(callsFor("identify_external_client")).toEqual([
+      ["identify_external_client", { pid: 4100, userId: 2 }],
+    ]);
+  });
+
+  it("starts the picker on the account the log named", async () => {
+    const user = userEvent.setup();
+    renderPanel({
+      launchedByProgram: new Set([1]),
+      unidentifiedClients: [unidentified(4400, "accountBusy", 1)],
+    });
+    await user.click(screen.getByRole("button", { name: /Identify/ }));
+    expect(screen.getByRole("combobox", { name: "Account for this client" })).toHaveValue("1");
+  });
+
+  it("surfaces the backend refusal when identifying fails", async () => {
+    const user = userEvent.setup();
+    setInvokeMap({ identify_external_client: () => Promise.reject("That Roblox client is no longer running.") });
+    renderPanel({ unidentifiedClients: [unidentified(4100, "noLog")] });
+
+    await user.click(screen.getByRole("button", { name: /Identify/ }));
+    await user.selectOptions(screen.getByRole("combobox", { name: "Account for this client" }), "3");
+    await user.click(screen.getByRole("button", { name: /Confirm/ }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("That Roblox client is no longer running.");
+  });
+
+  it("masks account names in the picker when names are hidden", async () => {
+    const user = userEvent.setup();
+    renderPanel({
+      unidentifiedClients: [unidentified(4100, "noLog")],
+      hideUsernames: true,
+      hiddenNameLetters: 2,
+    });
+    await user.click(screen.getByRole("button", { name: /Identify/ }));
+    const picker = screen.getByRole("combobox", { name: "Account for this client" });
+    expect(within(picker).queryByRole("option", { name: "Bravo Alt" })).not.toBeInTheDocument();
+    expect(within(picker).getByRole("option", { name: "Br********" })).toBeInTheDocument();
+  });
+});
+
+describe("SessionPanel — quedas lidas do log", () => {
+  function health(drop: Partial<ClientDrop> | null): ClientHealth {
+    return {
+      pid: 4242,
+      logFound: true,
+      drop: drop
+        ? { kind: "disconnected", reason: null, code: null, message: null, sinceMs: 1_700_000_000_000, ...drop }
+        : null,
+    };
+  }
+
+  it("shows why each account dropped, next to its name", () => {
+    renderPanel({
+      launchedByProgram: new Set([1, 2, 3]),
+      clientHealth: new Map([
+        [1, health({ kind: "disconnected", reason: "connectionLost", code: 277 })],
+        [2, health({ kind: "kicked", code: 267, message: "Server restarting" })],
+        [3, health({ kind: "serverShutdown", code: 274 })],
+      ]),
+    });
+    const lost = within(screen.getByTestId("session-running-1")).getByTestId("client-health-note");
+    expect(lost).toHaveTextContent("Disconnected: lost connection");
+    // O código fica no tooltip, para quem quiser procurar.
+    expect(lost).toHaveAttribute("title", expect.stringContaining("277"));
+    expect(within(screen.getByTestId("session-running-2")).getByText("Kicked: Server restarting")).toBeInTheDocument();
+    expect(within(screen.getByTestId("session-running-3")).getByText("The server shut down")).toBeInTheDocument();
+  });
+
+  it("says nothing for an account that is fine", () => {
+    renderPanel({
+      launchedByProgram: new Set([1, 2]),
+      clientHealth: new Map([[1, health(null)]]),
+    });
+    expect(screen.queryByTestId("client-health-note")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("client-wrong-account-note")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("session-wrong-account")).not.toBeInTheDocument();
+  });
+
+  it("warns at the top and on the row when a client opened as a different account, and keeps its buttons", () => {
+    renderPanel({
+      launchedByProgram: new Set([1, 2]),
+      clientHealth: new Map([
+        [1, health(null)],
+        [2, { ...health(null), inGame: true, wrongAccountUserId: 98765 }],
+      ]),
+    });
+    const banner = screen.getByTestId("session-wrong-account");
+    expect(banner).toHaveAttribute("role", "alert");
+    expect(banner).toHaveTextContent("Bravo Alt opened as a different Roblox account (user 98765).");
+    const row = screen.getByTestId("session-running-2");
+    expect(within(row).getByTestId("client-wrong-account-note")).toHaveTextContent(
+      "Opened as a different Roblox account (user 98765)"
+    );
+    // Só aviso: a linha da conta certa não ganha nada, e nenhum cliente é fechado.
+    expect(within(screen.getByTestId("session-running-1")).queryByTestId("client-wrong-account-note")).toBeNull();
+    expect(callsFor("cmd_kill_roblox")).toHaveLength(0);
+  });
+
+  it("a website client also shows its drop (display only, it keeps the same buttons)", () => {
+    renderPanel({
+      launchedByProgram: new Set([3]),
+      adoptedClients: new Set([3]),
+      clientHealth: new Map([[3, health({ kind: "disconnected", reason: "joinedElsewhere", code: 273 })]]),
+    });
+    const row = screen.getByTestId("session-running-3");
+    expect(within(row).getByText("Disconnected: the account joined somewhere else")).toBeInTheDocument();
+    expect(within(row).getByText("Opened outside the app")).toBeInTheDocument();
+  });
+
+  it("shows a hung window as not responding, in its own color", () => {
+    renderPanel({
+      launchedByProgram: new Set([1]),
+      clientHealth: new Map([[1, { ...health(null), notResponding: true }]]),
+    });
+    const note = within(screen.getByTestId("session-running-1")).getByTestId("client-health-note");
+    expect(note).toHaveTextContent("Not responding");
+    expect(note).toHaveAttribute("data-tone", "hung");
+  });
+});
+
+describe("SessionPanel — reconexão automática", () => {
+  const NOW = Date.now();
+
+  function reconnect(userId: number, partial: Partial<AutoReconnectEntry>): AutoReconnectEntry {
+    return {
+      userId,
+      phase: "waiting",
+      attempt: 1,
+      maxAttempts: 5,
+      nextAttemptAtMs: NOW + 30_000,
+      reason: null,
+      error: null,
+      drop: { kind: "disconnected", reason: "connectionLost", code: 277, message: null, sinceMs: NOW },
+      ...partial,
+    };
+  }
+
+  function reconnectActions(): Partial<StoreValue> {
+    return {
+      stopAutoReconnect: vi.fn(async (userId: number) => (await invokeMock("stop_auto_reconnect", { userId })) as boolean),
+      retryAutoReconnect: vi.fn(
+        async (userId: number) => (await invokeMock("retry_auto_reconnect", { userId })) as boolean
+      ),
+    };
+  }
+
+  beforeEach(() => {
+    setInvokeMap({ stop_auto_reconnect: true, retry_auto_reconnect: true });
+  });
+
+  it("has no section while nothing is reconnecting", () => {
+    renderPanel();
+    expect(screen.queryByTestId("auto-reconnect-panel")).not.toBeInTheDocument();
+  });
+
+  it("shows the countdown and the attempt, with Try now and Stop", async () => {
+    renderPanel({
+      ...reconnectActions(),
+      autoReconnect: [reconnect(1, { attempt: 2, nextAttemptAtMs: Date.now() + 30_000 })],
+    });
+    const row = screen.getByTestId("session-reconnect-1");
+    expect(within(row).getByText("alpha")).toBeInTheDocument();
+    expect(within(row).getByText(/^Reconnecting in (29|30) s \(attempt 2\/5\)$/)).toBeInTheDocument();
+
+    await userEvent.click(within(row).getByRole("button", { name: /Try now/ }));
+    expect(callsFor("retry_auto_reconnect")).toEqual([["retry_auto_reconnect", { userId: 1 }]]);
+    await userEvent.click(within(row).getByRole("button", { name: /Stop/ }));
+    expect(callsFor("stop_auto_reconnect")).toEqual([["stop_auto_reconnect", { userId: 1 }]]);
+    // Parar a reconexão nunca fecha cliente.
+    expect(callsFor("cmd_kill_roblox")).toHaveLength(0);
+  });
+
+  it("says when it gave up, and offers to try again or hide the line", async () => {
+    renderPanel({
+      ...reconnectActions(),
+      autoReconnect: [reconnect(2, { phase: "gaveUp", attempt: 5, error: "PID not detected" })],
+    });
+    const row = screen.getByTestId("session-reconnect-2");
+    expect(within(row).getByText("Gave up after 5 tries")).toBeInTheDocument();
+    expect(within(row).getByText("PID not detected")).toBeInTheDocument();
+    expect(within(row).getByRole("button", { name: /Try again/ })).toBeInTheDocument();
+    await userEvent.click(within(row).getByRole("button", { name: "Dismiss Bravo Alt" }));
+    expect(callsFor("stop_auto_reconnect")).toEqual([["stop_auto_reconnect", { userId: 2 }]]);
+  });
+
+  it("explains why it will not reconnect, without a retry for a banned account", () => {
+    renderPanel({
+      autoReconnect: [
+        reconnect(1, { phase: "stopped", reason: "joinedElsewhere" }),
+        reconnect(3, { phase: "stopped", reason: "banned" }),
+      ],
+    });
+    expect(
+      within(screen.getByTestId("session-reconnect-1")).getByText("Not reconnecting: the account joined somewhere else")
+    ).toBeInTheDocument();
+    const banned = screen.getByTestId("session-reconnect-3");
+    expect(within(banned).getByText("Not reconnecting: the account is banned")).toBeInTheDocument();
+    expect(within(banned).queryByRole("button", { name: /Try/ })).not.toBeInTheDocument();
+  });
+
+  it("shows the attempt in progress without a Try now", () => {
+    renderPanel({ autoReconnect: [reconnect(1, { phase: "launching", attempt: 3 })] });
+    const row = screen.getByTestId("session-reconnect-1");
+    expect(within(row).getByText("Reconnecting now (attempt 3/5)")).toBeInTheDocument();
+    expect(within(row).queryByRole("button", { name: /Try/ })).not.toBeInTheDocument();
+    expect(within(row).getByRole("button", { name: /Stop/ })).toBeInTheDocument();
+  });
+
+  /** A causa ficava só no tooltip: agora é uma segunda linha, à vista. */
+  it("shows the cause under the line, for a pending reconnect too", () => {
+    renderPanel({
+      autoReconnect: [
+        reconnect(2, { phase: "gaveUp", attempt: 5, error: "PID not detected" }),
+        reconnect(1, { phase: "waiting", attempt: 2, error: "It did not get into the game in 2 minutes" }),
+      ],
+    });
+    expect(screen.getByTestId("session-reconnect-detail-2")).toHaveTextContent("PID not detected");
+    expect(screen.getByTestId("session-reconnect-detail-1")).toHaveTextContent(
+      "It did not get into the game in 2 minutes"
+    );
+  });
+
+  it("has no cause line when there is no error", () => {
+    renderPanel({ autoReconnect: [reconnect(1, { phase: "waiting" })] });
+    expect(screen.queryByTestId("session-reconnect-detail-1")).not.toBeInTheDocument();
+  });
+
+  /** Sem retorno, o clique parecia não ter feito nada (e dava para clicar de novo). */
+  it("disables the line's buttons while the command runs", async () => {
+    let finish: (value: boolean) => void = () => {};
+    setInvokeMap({ retry_auto_reconnect: () => new Promise<boolean>((resolve) => (finish = resolve)) });
+    renderPanel({ ...reconnectActions(), autoReconnect: [reconnect(1, { phase: "waiting" })] });
+    const row = screen.getByTestId("session-reconnect-1");
+    await userEvent.click(within(row).getByRole("button", { name: /Try now/ }));
+    expect(within(row).getByRole("button", { name: /Try now/ })).toBeDisabled();
+    expect(within(row).getByRole("button", { name: /Stop/ })).toBeDisabled();
+    finish(true);
+    await waitFor(() => expect(within(row).getByRole("button", { name: /Try now/ })).not.toBeDisabled());
+  });
+
+  it("hides a dismissed line right away, before the backend answers", async () => {
+    setInvokeMap({ stop_auto_reconnect: () => new Promise<boolean>(() => {}) });
+    renderPanel({ ...reconnectActions(), autoReconnect: [reconnect(2, { phase: "gaveUp", attempt: 5 })] });
+    await userEvent.click(screen.getByRole("button", { name: "Dismiss Bravo Alt" }));
+    expect(screen.queryByTestId("session-reconnect-2")).not.toBeInTheDocument();
+  });
+
+  it("says so when the account is no longer reconnecting", async () => {
+    setInvokeMap({ stop_auto_reconnect: false, retry_auto_reconnect: false });
+    const { store } = renderPanel({
+      ...reconnectActions(),
+      autoReconnect: [reconnect(2, { phase: "gaveUp", attempt: 5 }), reconnect(1, { phase: "waiting" })],
+    });
+    await userEvent.click(within(screen.getByTestId("session-reconnect-1")).getByRole("button", { name: /Try now/ }));
+    await waitFor(() =>
+      expect(store.addToast).toHaveBeenCalledWith("alpha is no longer being reconnected.", "info")
+    );
+    // Dispensar uma que o backend já não tem: some do mesmo jeito, com o aviso.
+    await userEvent.click(screen.getByRole("button", { name: "Dismiss Bravo Alt" }));
+    await waitFor(() =>
+      expect(store.addToast).toHaveBeenCalledWith("Bravo Alt is no longer being reconnected.", "info")
+    );
+    expect(screen.queryByTestId("session-reconnect-2")).not.toBeInTheDocument();
+  });
+
+  it("brings a dismissed line back when the command fails", async () => {
+    setInvokeMap({
+      stop_auto_reconnect: () => {
+        throw new Error("boom");
+      },
+    });
+    renderPanel({ ...reconnectActions(), autoReconnect: [reconnect(2, { phase: "gaveUp", attempt: 5 })] });
+    await userEvent.click(screen.getByRole("button", { name: "Dismiss Bravo Alt" }));
+    await waitFor(() => expect(screen.getByTestId("session-reconnect-2")).toBeInTheDocument());
+    expect(screen.getByText(/boom/)).toBeInTheDocument();
+  });
+
+  it("shows a new drop of a dismissed account again", async () => {
+    setInvokeMap({ stop_auto_reconnect: () => new Promise<boolean>(() => {}) });
+    const actions = reconnectActions();
+    const { rerender } = renderPanel({ ...actions, autoReconnect: [reconnect(2, { phase: "gaveUp", attempt: 5 })] });
+    await userEvent.click(screen.getByRole("button", { name: "Dismiss Bravo Alt" }));
+    expect(screen.queryByTestId("session-reconnect-2")).not.toBeInTheDocument();
+    // Caiu de novo: outra queda (outro `sinceMs`) é outra linha.
+    const again = reconnect(2, { phase: "waiting" });
+    setStore({
+      accounts: ACCOUNTS,
+      ...storeActions(),
+      ...actions,
+      autoReconnect: [{ ...again, drop: { ...again.drop, sinceMs: NOW + 60_000 } }],
+    });
+    rerender(<SessionPanel />);
+    expect(screen.getByTestId("session-reconnect-2")).toBeInTheDocument();
+  });
+});
+
+/** Abre o menu de um chip e escolhe uma opção. */
+async function pickFromChip(chip: HTMLElement, option: string | RegExp) {
+  await userEvent.click(chip);
+  await userEvent.click(screen.getByRole("menuitemradio", { name: option }));
+}
+
+/**
+ * Reconexão automática por conta, na lista "Em jogo" (antes ficava no painel
+ * de uma conta, que quase ninguém abre com muitas contas). O campo da conta
+ * (`Fields.AutoReconnect`) manda; sem ele vale `General.AutoReconnect`; o
+ * AutoRelaunch do Nexus liga por cima (`reconnect_enabled`, commands/reconnect.rs).
+ * Desde 11/10/2026 é um chip (↻ On/Off) com um menu, no lugar da chave.
+ */
+describe("SessionPanel — reconexão por conta", () => {
+  function renderRunning(overrides: Partial<StoreValue> = {}, accounts: Account[] = ACCOUNTS) {
+    return renderWithStore(<SessionPanel />, {
+      accounts,
+      launchedByProgram: new Set(accounts.map((a) => a.UserID)),
+      ...storeActions(),
+      ...overrides,
+    });
+  }
+
+  function savedAccounts(store: StoreValue): Account[] {
+    return (store.updateAccount as unknown as { mock: { calls: [Account][] } }).mock.calls.map((c) => c[0]);
+  }
+
+  function clearSaved(store: StoreValue) {
+    (store.updateAccount as unknown as { mockClear: () => void }).mockClear();
+  }
+
+  function rowChip(userId: number) {
+    return within(screen.getByTestId(`session-running-${userId}`)).getByTestId("reconnect-chip");
+  }
+
+  beforeEach(() => {
+    setInvokeMap({ get_nexus_accounts: [] });
+  });
+
+  it("each row follows the default until the account changes it, and says so", async () => {
+    renderRunning({ settings: { General: { AutoReconnect: "true" } } });
+    const chip = rowChip(1);
+    expect(chip).toHaveAccessibleName("Auto-reconnect for alpha: on (default)");
+    // "On" sozinho na linha não dizia de quê: o chip diz "Reconnect: on".
+    expect(chip).toHaveTextContent("Reconnect: on");
+    expect(chip).toHaveAttribute("title", "Following the default for all accounts (on).");
+    await userEvent.click(chip);
+    expect(screen.getByRole("menuitemradio", { name: "Use the default (on)" })).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByRole("menuitemradio", { name: "On" })).toHaveAttribute("aria-checked", "false");
+  });
+
+  it("turning a row off writes the account field and keeps the other fields", async () => {
+    const accounts = [makeAccount({ UserID: 1, Username: "alpha", Fields: { RobloxVersion: "LIVE:abc" } })];
+    const { store } = renderRunning({ settings: { General: { AutoReconnect: "true" } } }, accounts);
+    await pickFromChip(rowChip(1), "Off");
+    const [saved] = savedAccounts(store);
+    expect(saved.Fields.AutoReconnect).toBe("false");
+    expect(saved.Fields.RobloxVersion).toBe("LIVE:abc");
+  });
+
+  it("the account's own choice wins over the default, and can go back to it", async () => {
+    const accounts = [makeAccount({ UserID: 1, Username: "alpha", Fields: { AutoReconnect: "false" } })];
+    const { store } = renderRunning({ settings: { General: { AutoReconnect: "true" } } }, accounts);
+    expect(rowChip(1)).toHaveAccessibleName("Auto-reconnect for alpha: off");
+    await pickFromChip(rowChip(1), "Use the default (on)");
+    expect(savedAccounts(store)[0].Fields).not.toHaveProperty("AutoReconnect");
+  });
+
+  it("shows the row locked on when Nexus AutoRelaunch keeps it on", async () => {
+    setInvokeMap({ get_nexus_accounts: [{ username: "ALPHA", auto_relaunch: true }] });
+    const accounts = [makeAccount({ UserID: 1, Username: "alpha", Fields: { AutoReconnect: "false" } })];
+    renderRunning({}, accounts);
+    await waitFor(() => expect(rowChip(1)).toHaveAccessibleName("Auto-reconnect for alpha: on"));
+    expect(rowChip(1)).toHaveAttribute("aria-disabled", "true");
+    expect(rowChip(1)).toHaveAttribute(
+      "title",
+      "Nexus AutoRelaunch is on for this account, so it reconnects even with this off."
+    );
+    await userEvent.click(rowChip(1));
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+  });
+
+  it("does not blame Nexus when its AutoRelaunch is off for the account", async () => {
+    setInvokeMap({ get_nexus_accounts: [{ username: "alpha", auto_relaunch: false }] });
+    renderRunning({}, [makeAccount({ UserID: 1, Username: "alpha" })]);
+    await waitFor(() => expect(callsFor("get_nexus_accounts")).toHaveLength(1));
+    expect(rowChip(1)).toHaveAccessibleName("Auto-reconnect for alpha: off (default)");
+    expect(rowChip(1)).not.toHaveAttribute("aria-disabled");
+  });
+
+  it("the menu works from the keyboard and Escape closes it", async () => {
+    const { store } = renderRunning({ settings: { General: { AutoReconnect: "true" } } }, [
+      makeAccount({ UserID: 1, Username: "alpha" }),
+    ]);
+    rowChip(1).focus();
+    await userEvent.keyboard("{ArrowDown}");
+    // Abre com o foco na opção escolhida ("Use the default").
+    expect(screen.getByRole("menuitemradio", { name: "Use the default (on)" })).toHaveFocus();
+    await userEvent.keyboard("{Escape}");
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    expect(rowChip(1)).toHaveFocus();
+    await userEvent.keyboard("{Enter}");
+    await userEvent.keyboard("{Home}{ArrowDown}{Enter}");
+    expect(savedAccounts(store)[0].Fields.AutoReconnect).toBe("false");
+  });
+
+  it("bulk: the checked rows turn on, off, or go back to the default", async () => {
+    const accounts = [
+      makeAccount({ UserID: 1, Username: "alpha", Fields: { AutoReconnect: "false" } }),
+      makeAccount({ UserID: 2, Username: "bravo" }),
+      makeAccount({ UserID: 3, Username: "charlie" }),
+    ];
+    const { store } = renderRunning({}, accounts);
+    // Nada marcado: o lote não aparece.
+    expect(screen.queryByRole("button", { name: /Auto-reconnect for \d+ selected/ })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("checkbox", { name: "Select alpha" }));
+    await userEvent.click(screen.getByRole("checkbox", { name: "Select bravo" }));
+    const bulk = screen.getByRole("button", { name: "Auto-reconnect for 2 selected" });
+
+    await pickFromChip(bulk, "On");
+    expect(savedAccounts(store).map((a) => [a.UserID, a.Fields.AutoReconnect])).toEqual([
+      [1, "true"],
+      [2, "true"],
+    ]);
+
+    clearSaved(store);
+    await pickFromChip(bulk, "Off");
+    expect(savedAccounts(store).map((a) => [a.UserID, a.Fields.AutoReconnect])).toEqual([
+      [1, "false"],
+      [2, "false"],
+    ]);
+
+    clearSaved(store);
+    await pickFromChip(bulk, /Use the default/);
+    const saved = savedAccounts(store);
+    expect(saved.map((a) => a.UserID)).toEqual([1, 2]);
+    expect(saved.every((a) => !("AutoReconnect" in a.Fields))).toBe(true);
+    // Mudar a reconexão nunca fecha cliente.
+    expect(callsFor("cmd_kill_roblox")).toHaveLength(0);
+  });
+
+  it("explains a reconnect still running after the account was turned off", () => {
+    renderRunning(
+      {
+        autoReconnect: [
+          {
+            userId: 1,
+            phase: "launching",
+            attempt: 2,
+            maxAttempts: 5,
+            nextAttemptAtMs: null,
+            reason: null,
+            error: null,
+            drop: { kind: "crashed", reason: null, code: null, message: null, sinceMs: 0 },
+          },
+        ],
+      },
+      [makeAccount({ UserID: 1, Username: "alpha", Fields: { AutoReconnect: "false" } })]
+    );
+    expect(
+      within(screen.getByTestId("session-reconnect-1")).getByText(
+        "Turned off: it stops after the attempt in progress."
+      )
+    ).toBeInTheDocument();
+  });
+
+  it("has no reconnect controls outside Windows, where the Roblox log is not read", async () => {
+    renderRunning({ platformCapabilities: makePlatformCapabilities({ os: "macos" }) });
+    expect(within(screen.getByTestId("session-running-1")).queryByTestId("reconnect-chip")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("checkbox", { name: "Select alpha" }));
+    expect(screen.queryByRole("button", { name: /Auto-reconnect for 1 selected/ })).not.toBeInTheDocument();
+  });
+});
+
+/**
+ * Teto de memória por cliente, na lista "Em jogo" (commands/memory_ceiling.rs).
+ * A linha mostra a memória do cliente (do polling de 2,5 s) e o limite num
+ * chip; o menu grava o campo `MemoryLimit` da conta (vale na hora e nos
+ * próximos launches); sem campo, vale `Optimization.MemoryLimit`. Só cliente
+ * que o app abriu, e só com a feature `memory-trim` no binário.
+ */
+describe("SessionPanel — limite de memória por cliente", () => {
+  const TRIM = makePlatformCapabilities({ supportsMemoryTrim: true });
+
+  function renderRunning(overrides: Partial<StoreValue> = {}, accounts: Account[] = ACCOUNTS) {
+    return renderWithStore(<SessionPanel />, {
+      accounts,
+      launchedByProgram: new Set(accounts.map((a) => a.UserID)),
+      platformCapabilities: TRIM,
+      ...storeActions(),
+      ...overrides,
+    });
+  }
+
+  function savedAccounts(store: StoreValue): Account[] {
+    return (store.updateAccount as unknown as { mock: { calls: [Account][] } }).mock.calls.map((c) => c[0]);
+  }
+
+  function clearSaved(store: StoreValue) {
+    (store.updateAccount as unknown as { mockClear: () => void }).mockClear();
+  }
+
+  function memoryChip(userId: number) {
+    return within(screen.getByTestId(`session-running-${userId}`)).getByTestId("memory-chip");
+  }
+
+  beforeEach(() => {
+    setInvokeMap({ get_nexus_accounts: [] });
+  });
+
+  it("shows the client's memory next to its limit and follows the default until the account picks its own", async () => {
+    renderRunning({
+      settings: { Optimization: { MemoryLimit: "2048" } },
+      clientMemory: new Map([[1, { memoryMb: 1250, limitMb: 2048, over: false, trimmedAtMs: null }]]),
+    });
+    const chip = memoryChip(1);
+    expect(chip).toHaveTextContent("1,250 MB/ 2 GB");
+    expect(chip).toHaveAccessibleName("Memory limit for alpha: default, 2 GB");
+    expect(chip).toHaveAttribute("title", expect.stringMatching(/Following the default \(2 GB\)/));
+    await userEvent.click(chip);
+    expect(screen.getByRole("menuitemradio", { name: "Default (2 GB)" })).toHaveAttribute("aria-checked", "true");
+  });
+
+  it("says when there is no default limit", async () => {
+    renderRunning();
+    expect(memoryChip(1)).toHaveAttribute("title", expect.stringMatching(/Following the default \(no limit\)/));
+    await userEvent.click(memoryChip(1));
+    expect(screen.getByRole("menuitemradio", { name: "Default (no limit)" })).toBeInTheDocument();
+  });
+
+  /**
+   * O seletor de 104 px cobria a leitura de memória e o aviso de acima do
+   * limite (achado do detector, 11/10/2026). No chip a leitura é o próprio
+   * texto, e a linha não tem mais seletor nativo nenhum.
+   */
+  it("keeps the memory reading in view, with no native picker covering it", () => {
+    renderRunning({
+      clientMemory: new Map([[1, { memoryMb: 2500, limitMb: 2048, over: true, trimmedAtMs: 1 }]]),
+    });
+    const row = screen.getByTestId("session-running-1");
+    expect(within(row).queryByRole("combobox")).not.toBeInTheDocument();
+    expect(within(memoryChip(1)).getByTestId("memory-reading")).toHaveTextContent("2,500 MB");
+  });
+
+  /**
+   * Relato do dono (11/10/2026): o número da linha parecia lido nos primeiros
+   * segundos e nunca mais mudava. A leitura segue cada polling da store.
+   */
+  it("the reading follows every refresh of the running clients", async () => {
+    const { rerender } = renderRunning({
+      clientMemory: new Map([[1, { memoryMb: 1187, limitMb: null, over: false, trimmedAtMs: null }]]),
+    });
+    expect(within(memoryChip(1)).getByTestId("memory-reading")).toHaveTextContent("1,187 MB");
+    for (const memoryMb of [1203, 1164, 1342]) {
+      setStore({
+        accounts: ACCOUNTS,
+        launchedByProgram: new Set(ACCOUNTS.map((a) => a.UserID)),
+        platformCapabilities: TRIM,
+        ...storeActions(),
+        clientMemory: new Map([[1, { memoryMb, limitMb: null, over: false, trimmedAtMs: null }]]),
+      });
+      rerender(<SessionPanel />);
+      await waitFor(() =>
+        expect(within(memoryChip(1)).getByTestId("memory-reading")).toHaveTextContent(
+          `${memoryMb.toLocaleString("en-US")} MB`
+        )
+      );
+    }
+  });
+
+  it("says the number is the same as Task Manager's", () => {
+    renderRunning({
+      clientMemory: new Map([[1, { memoryMb: 1187, limitMb: 2048, over: false, trimmedAtMs: null }]]),
+    });
+    expect(memoryChip(1)).toHaveAttribute(
+      "title",
+      expect.stringContaining("Private memory now: 1,187 MB (the Memory column in Task Manager).")
+    );
+  });
+
+  /** Depois de liberar, a memória fica mais baixa até o jogo precisar: normal. */
+  it("after a trim, under the limit, it says the lower memory is expected", () => {
+    renderRunning({
+      clientMemory: new Map([[1, { memoryMb: 380, limitMb: 2048, over: false, trimmedAtMs: 1 }]]),
+    });
+    expect(memoryChip(1)).toHaveAttribute(
+      "title",
+      expect.stringContaining(
+        "MultiAlt freed this client's memory: it stays lower until the game needs it again, which is expected."
+      )
+    );
+  });
+
+  it("picking a size writes the account field and keeps the other fields, closing nothing", async () => {
+    const accounts = [makeAccount({ UserID: 1, Username: "alpha", Fields: { RobloxVersion: "LIVE:abc" } })];
+    const { store } = renderRunning({}, accounts);
+    await pickFromChip(memoryChip(1), "2 GB");
+    const [saved] = savedAccounts(store);
+    expect(saved.Fields.MemoryLimit).toBe("2048");
+    expect(saved.Fields.RobloxVersion).toBe("LIVE:abc");
+    expect(callsFor("cmd_kill_roblox")).toHaveLength(0);
+  });
+
+  it("no limit is its own choice, and default removes the field", async () => {
+    const accounts = [makeAccount({ UserID: 1, Username: "alpha", Fields: { MemoryLimit: "1536" } })];
+    const { store } = renderRunning({ settings: { Optimization: { MemoryLimit: "2048" } } }, accounts);
+    expect(memoryChip(1)).toHaveAccessibleName("Memory limit for alpha: 1.5 GB");
+    await pickFromChip(memoryChip(1), "No limit");
+    expect(savedAccounts(store)[0].Fields.MemoryLimit).toBe("0");
+    clearSaved(store);
+    await pickFromChip(memoryChip(1), "Default (2 GB)");
+    expect(savedAccounts(store)[0].Fields).not.toHaveProperty("MemoryLimit");
+  });
+
+  it("a custom size is asked for, in MB or GB", async () => {
+    const { store } = renderRunning({}, [makeAccount({ UserID: 1, Username: "alpha" })]);
+    promptAnswers.prompt = "2.5 GB";
+    await pickFromChip(memoryChip(1), "Custom…");
+    await waitFor(() => expect(savedAccounts(store)[0]?.Fields.MemoryLimit).toBe("2560"));
+  });
+
+  it("a cancelled or unreadable custom size saves nothing", async () => {
+    const { store } = renderRunning({}, [makeAccount({ UserID: 1, Username: "alpha" })]);
+    promptAnswers.prompt = null;
+    await pickFromChip(memoryChip(1), "Custom…");
+    promptAnswers.prompt = "lots";
+    await pickFromChip(memoryChip(1), "Custom…");
+    await waitFor(() => expect(promptMock).toHaveBeenCalledTimes(2));
+    expect(savedAccounts(store)).toHaveLength(0);
+  });
+
+  it("a custom size already saved shows up as its own option", async () => {
+    renderRunning({}, [makeAccount({ UserID: 1, Username: "alpha", Fields: { MemoryLimit: "1800" } })]);
+    await userEvent.click(memoryChip(1));
+    expect(screen.getByRole("menuitemradio", { name: "1.8 GB" })).toHaveAttribute("aria-checked", "true");
+  });
+
+  it("over the limit, the chip turns amber and says the memory was freed", () => {
+    renderRunning({
+      clientMemory: new Map([[1, { memoryMb: 2500, limitMb: 2048, over: true, trimmedAtMs: 1 }]]),
+    });
+    const chip = memoryChip(1);
+    expect(chip.className).toMatch(/amber/);
+    expect(chip).toHaveAttribute(
+      "title",
+      expect.stringContaining("Over its limit of 2 GB: MultiAlt asked Windows to free this client's memory.")
+    );
+  });
+
+  it("a client opened from the website has no limit control", () => {
+    renderRunning({ adoptedClients: new Set([3]) });
+    expect(within(screen.getByTestId("session-running-3")).queryByTestId("memory-chip")).not.toBeInTheDocument();
+    expect(memoryChip(1)).toBeInTheDocument();
+  });
+
+  it("without the memory-trim build there is no memory control at all", async () => {
+    renderRunning({
+      platformCapabilities: makePlatformCapabilities({ supportsMemoryTrim: false }),
+      clientMemory: new Map([[1, { memoryMb: 1250, limitMb: null, over: false, trimmedAtMs: null }]]),
+    });
+    expect(screen.queryByTestId("memory-chip")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("checkbox", { name: "Select alpha" }));
+    expect(screen.queryByRole("button", { name: /Memory limit for 1 selected/ })).not.toBeInTheDocument();
+  });
+
+  it("bulk: the checked rows get the same limit, or go back to the default", async () => {
+    const accounts = [
+      makeAccount({ UserID: 1, Username: "alpha", Fields: { MemoryLimit: "1024" } }),
+      makeAccount({ UserID: 2, Username: "bravo" }),
+      makeAccount({ UserID: 3, Username: "charlie" }),
+    ];
+    const { store } = renderRunning({}, accounts);
+    expect(screen.queryByRole("button", { name: /Memory limit for \d+ selected/ })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("checkbox", { name: "Select alpha" }));
+    await userEvent.click(screen.getByRole("checkbox", { name: "Select bravo" }));
+
+    const bulk = screen.getByRole("button", { name: "Memory limit for 2 selected" });
+    await pickFromChip(bulk, "3 GB");
+    await waitFor(() =>
+      expect(savedAccounts(store).map((a) => [a.UserID, a.Fields.MemoryLimit])).toEqual([
+        [1, "3072"],
+        [2, "3072"],
+      ])
+    );
+
+    clearSaved(store);
+    await pickFromChip(bulk, /^Default/);
+    await waitFor(() => expect(savedAccounts(store)).toHaveLength(2));
+    expect(savedAccounts(store).every((a) => !("MemoryLimit" in a.Fields))).toBe(true);
+    expect(callsFor("cmd_kill_roblox")).toHaveLength(0);
+  });
+
+  it("bulk skips the clients opened from the website", async () => {
+    const { store } = renderRunning({ adoptedClients: new Set([3]) });
+    await userEvent.click(screen.getByRole("checkbox", { name: "Select all running clients" }));
+    await pickFromChip(screen.getByRole("button", { name: "Memory limit for 2 selected" }), "2 GB");
+    await waitFor(() => expect(savedAccounts(store).map((a) => a.UserID)).toEqual([1, 2]));
+  });
+});
+
+/**
+ * Sessão de agora em cada linha do "Em jogo": jogo, tipo de servidor, tempo em
+ * jogo (andando) e estado. O início é o mesmo que o histórico grava
+ * (`get_current_sessions`, commands/session_history.rs); a tela relê no
+ * `session-history-changed`, sem polling.
+ */
+describe("SessionPanel — sessão atual", () => {
+  const MIN = 60_000;
+
+  function current(userId: number, partial: Partial<CurrentSession> = {}): CurrentSession {
+    return {
+      userId,
+      placeId: 606849621,
+      jobId: "job-1",
+      sinceMs: Date.now() - 12 * MIN,
+      privateServer: false,
+      ...partial,
+    };
+  }
+
+  function renderRunning(sessions: CurrentSession[], overrides: Partial<StoreValue> = {}) {
+    setInvokeMap({
+      get_nexus_accounts: [],
+      get_current_sessions: () => sessions,
+      batched_get_game_info: (args: Record<string, unknown> | undefined) => ({
+        placeId: Number(args?.placeId),
+        universeId: 1,
+        name: Number(args?.placeId) === 606849621 ? "Jailbreak" : null,
+        iconUrl: null,
+      }),
+    });
+    return renderWithStore(<SessionPanel />, {
+      accounts: ACCOUNTS,
+      launchedByProgram: new Set([1, 2, 3]),
+      ...storeActions(),
+      ...overrides,
+    });
+  }
+
+  beforeEach(() => {
+    clearGameIdentityCache();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("shows the game, the server type and the time in game of each account", async () => {
+    renderRunning([current(1), current(2, { privateServer: true, jobId: "vip-2", sinceMs: Date.now() - 65 * MIN })]);
+    // O jogo vai no cabeçalho do grupo, o servidor no do servidor, o tempo na linha.
+    const game = within(await screen.findByTestId("session-game-606849621"));
+    expect(await game.findByText("Jailbreak")).toBeInTheDocument();
+    expect(within(screen.getByTestId("session-server-job-1")).getByText("Public server")).toBeInTheDocument();
+    expect(within(screen.getByTestId("session-server-vip-2")).getByText("Private server")).toBeInTheDocument();
+
+    const first = within(screen.getByTestId("session-running-1"));
+    expect(first.getByTestId("session-time-1")).toHaveTextContent("12m");
+    expect(first.getByText("Playing")).toBeInTheDocument();
+    expect(within(screen.getByTestId("session-running-2")).getByTestId("session-time-2")).toHaveTextContent("1h 05m");
+  });
+
+  it("shows each server's region and how long it has been up, from the client log", async () => {
+    const health = (server: ClientHealth["server"]): ClientHealth => ({
+      pid: 1,
+      logFound: true,
+      drop: null,
+      inGame: true,
+      server,
+    });
+    renderRunning([current(1), current(2, { privateServer: true, jobId: "vip-2" }), current(3, { jobId: "job-3" })], {
+      clientHealth: new Map([
+        [1, health({ region: "Miami, US", startedAtMs: Date.now() - 3 * 60 * MIN - 5 * MIN })],
+        // Região ainda sendo descoberta: só o tempo no ar.
+        [2, health({ region: null, startedAtMs: Date.now() - 25 * MIN })],
+        // O log ainda não disse nada do servidor.
+        [3, health(null)],
+      ]),
+    });
+    const publicServer = within(await screen.findByTestId("session-server-job-1"));
+    expect(publicServer.getByTestId("session-server-info")).toHaveTextContent("Miami, US · server up for 3 h");
+    expect(within(screen.getByTestId("session-server-vip-2")).getByTestId("session-server-info")).toHaveTextContent(
+      "server up for 25 min"
+    );
+    expect(within(screen.getByTestId("session-server-job-3")).queryByTestId("session-server-info")).toBeNull();
+  });
+
+  it("falls back to the Place ID while the game name is unknown, with the full name in a tooltip", async () => {
+    renderRunning([current(1, { placeId: 123456 })]);
+    const group = within(await screen.findByTestId("session-game-123456"));
+    const game = await group.findByText("Place 123456");
+    expect(game.closest("button")).toHaveAttribute("title", "Place 123456");
+    await waitFor(() => expect(callsFor("batched_get_game_info").length).toBeGreaterThan(0));
+    expect(group.getByText("Place 123456")).toBeInTheDocument();
+  });
+
+  /**
+   * Com um servidor só no jogo, a caixa do servidor marcava exatamente o mesmo
+   * que a do jogo: duas caixas iguais, uma embaixo da outra. Ela (e a
+   * contagem, que repetia a do jogo) só aparece quando há mais de um servidor.
+   */
+  it("a game with a single server has no second checkbox for that server", async () => {
+    renderRunning([current(1), current(2)]);
+    const server = within(await screen.findByTestId("session-server-job-1"));
+    expect(server.queryByRole("checkbox", { name: /^Select Public server/ })).not.toBeInTheDocument();
+    expect(server.queryByText("2 accounts")).not.toBeInTheDocument();
+  });
+
+  it("a game with two servers lets each server be selected on its own", async () => {
+    renderRunning([current(1), current(2, { privateServer: true, jobId: "vip-2" })]);
+    const vip = within(await screen.findByTestId("session-server-vip-2"));
+    expect(vip.getByRole("checkbox", { name: /^Select Private server/ })).toBeInTheDocument();
+    expect(vip.getByText("1 account")).toBeInTheDocument();
+  });
+
+  it("says nothing about public or private when the server type is not known (opened from the website)", async () => {
+    renderRunning([current(1, { privateServer: null })]);
+    const server = within(await screen.findByTestId("session-server-job-1"));
+    expect(server.getByText("Server")).toBeInTheDocument();
+    expect(server.queryByText("Public server")).not.toBeInTheDocument();
+    expect(server.queryByText("Private server")).not.toBeInTheDocument();
+  });
+
+  it("the time in game ticks on its own", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    renderRunning([current(1, { sinceMs: Date.now() - 58_000 })]);
+    const time = await screen.findByTestId("session-time-1");
+    expect(time).toHaveTextContent("58s");
+    await act(async () => {
+      vi.advanceTimersByTime(3_000);
+    });
+    expect(screen.getByTestId("session-time-1")).toHaveTextContent("1m");
+  });
+
+  it("reads the sessions again when the history changes, and does not poll", async () => {
+    let sessions: CurrentSession[] = [];
+    setInvokeMap({ get_nexus_accounts: [], get_current_sessions: () => sessions });
+    renderWithStore(<SessionPanel />, {
+      accounts: ACCOUNTS,
+      launchedByProgram: new Set([1]),
+      ...storeActions(),
+    });
+    await waitFor(() => expect(callsFor("get_current_sessions")).toHaveLength(1));
+    expect(screen.queryByTestId("session-time-1")).not.toBeInTheDocument();
+
+    sessions = [current(1, { sinceMs: Date.now() - 5 * MIN })];
+    await act(async () => {
+      emitTauriEvent("session-history-changed", { userIds: [1] });
+    });
+    expect(await screen.findByTestId("session-time-1")).toHaveTextContent("5m");
+    expect(callsFor("get_current_sessions")).toHaveLength(2);
+  });
+
+  it("an account that is not in a game yet has no time and says so", async () => {
+    renderRunning([], {
+      clientHealth: new Map([[1, { pid: 1, logFound: true, drop: null, inGame: false }]]),
+    });
+    const row = within(screen.getByTestId("session-running-1"));
+    expect(await row.findByText("Not in a game yet")).toBeInTheDocument();
+    expect(row.queryByTestId("session-time-1")).not.toBeInTheDocument();
+  });
+
+  /**
+   * Bateria de 25/10/2026, com Roblox de verdade: a conta foi para "Precisa de
+   * atenção" mas a linha dizia "Ainda fora de um jogo". Ela diz o que é.
+   */
+  it("an account waiting on Roblox's human check says so, not 'not in a game yet'", async () => {
+    renderRunning([], {
+      clientHealth: new Map([[1, { pid: 1, logFound: true, drop: null, inGame: false, challenge: true }]]),
+    });
+    const row = within(screen.getByTestId("session-running-1"));
+    expect(await row.findByText("Roblox human check")).toBeInTheDocument();
+    expect(row.queryByText("Not in a game yet")).not.toBeInTheDocument();
+  });
+
+  it("a dropped account shows why, not Playing nor the time", async () => {
+    renderRunning([], {
+      clientHealth: new Map([
+        [
+          1,
+          {
+            pid: 1,
+            logFound: true,
+            drop: { kind: "disconnected", reason: "connectionLost", code: 277, message: null, sinceMs: 0 },
+            inGame: false,
+          },
+        ],
+      ]),
+    });
+    const row = within(screen.getByTestId("session-running-1"));
+    expect(await row.findByText("Disconnected: lost connection")).toBeInTheDocument();
+    expect(row.queryByText("Playing")).not.toBeInTheDocument();
+    expect(row.queryByText("Not in a game yet")).not.toBeInTheDocument();
+  });
+
+  it("an account being reconnected says so in its row", async () => {
+    renderRunning([], {
+      autoReconnect: [
+        {
+          userId: 1,
+          phase: "launching",
+          attempt: 1,
+          maxAttempts: 5,
+          nextAttemptAtMs: null,
+          reason: null,
+          error: null,
+          drop: { kind: "crashed", reason: null, code: null, message: null, sinceMs: 0 },
+        },
+      ],
+    });
+    const row = within(screen.getByTestId("session-running-1"));
+    expect(await row.findByText("Reconnecting")).toBeInTheDocument();
+  });
+});
+
+/**
+ * "Em jogo" agrupado por jogo e servidor (pedido do dono, 11/10/2026): quem tem
+ * muitas contas quer ver quem está junto de quem. Quem precisa de atenção
+ * (caiu, não responde, reconectando) vai para o topo, à parte.
+ */
+describe("SessionPanel — Em jogo por jogo e servidor", () => {
+  const MIN = 60_000;
+  const FOUR = [...ACCOUNTS, makeAccount({ UserID: 4, Username: "delta" })];
+
+  function current(userId: number, placeId: number, jobId: string | null, privateServer: boolean | null = false): CurrentSession {
+    return { userId, placeId, jobId, sinceMs: Date.now() - 12 * MIN, privateServer };
+  }
+
+  const GAMES: Record<number, { name: string; iconUrl: string | null }> = {
+    606849621: { name: "Jailbreak", iconUrl: "https://tr.rbxcdn.com/jailbreak.png" },
+    6516141723: { name: "Blox Fruits", iconUrl: null },
+  };
+
+  function renderGrouped(sessions: CurrentSession[], overrides: Partial<StoreValue> = {}) {
+    setInvokeMap({
+      get_nexus_accounts: [],
+      get_current_sessions: () => sessions,
+      batched_get_game_info: (args: Record<string, unknown> | undefined) => {
+        const placeId = Number(args?.placeId);
+        return { placeId, universeId: 1, name: GAMES[placeId]?.name ?? null, iconUrl: GAMES[placeId]?.iconUrl ?? null };
+      },
+    });
+    return renderWithStore(<SessionPanel />, {
+      accounts: FOUR,
+      launchedByProgram: new Set([1, 2, 3, 4]),
+      ...storeActions(),
+      ...overrides,
+    });
+  }
+
+  const rowIds = (container: HTMLElement) =>
+    [...container.querySelectorAll("[data-testid^='session-running-']")].map((el) =>
+      Number(el.getAttribute("data-testid")!.replace("session-running-", ""))
+    );
+
+  beforeEach(() => {
+    clearGameIdentityCache();
+  });
+
+  it("groups the accounts by game, biggest first, with the count and the game's picture", async () => {
+    renderGrouped([
+      current(1, 606849621, "job-a"),
+      current(2, 6516141723, "job-b"),
+      current(3, 606849621, "job-a"),
+      current(4, 606849621, "job-c"),
+    ]);
+    const jailbreak = await screen.findByTestId("session-game-606849621");
+    expect(await within(jailbreak).findByText("Jailbreak")).toBeInTheDocument();
+    expect(within(jailbreak).getByText("3 accounts")).toBeInTheDocument();
+    expect(rowIds(jailbreak)).toEqual([1, 3, 4]);
+    await waitFor(() =>
+      expect(jailbreak.querySelector("img")).toHaveAttribute("src", "https://tr.rbxcdn.com/jailbreak.png")
+    );
+
+    const fruits = screen.getByTestId("session-game-6516141723");
+    expect(rowIds(fruits)).toEqual([2]);
+    expect(jailbreak.compareDocumentPosition(fruits) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("puts accounts on the same server together, under the server", async () => {
+    renderGrouped([
+      current(1, 606849621, "1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d"),
+      current(2, 606849621, "vip-9", true),
+      current(3, 606849621, "1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d"),
+      current(4, 606849621, null, null),
+    ]);
+    const shared = await screen.findByTestId("session-server-1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d");
+    expect(rowIds(shared)).toEqual([1, 3]);
+    expect(within(shared).getByText("Public server")).toBeInTheDocument();
+    expect(within(shared).getByText("1a2b3c4d")).toHaveAttribute("title", "1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d");
+    expect(within(screen.getByTestId("session-server-vip-9")).getByText("Private server")).toBeInTheDocument();
+    expect(within(screen.getByTestId("session-server-unknown")).getByText("Server unknown")).toBeInTheDocument();
+  });
+
+  it("a game's checkbox selects its accounts", async () => {
+    renderGrouped([current(1, 606849621, "job-a"), current(2, 6516141723, "job-b"), current(3, 606849621, "job-a")]);
+    const jailbreak = await screen.findByTestId("session-game-606849621");
+    await within(jailbreak).findByText("Jailbreak");
+    await userEvent.click(within(jailbreak).getByRole("checkbox", { name: "Select Jailbreak" }));
+    expect(screen.getByRole("checkbox", { name: "Select alpha" })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Select charlie" })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Select Bravo Alt" })).not.toBeChecked();
+    // Clicar de novo desmarca o grupo inteiro.
+    await userEvent.click(within(jailbreak).getByRole("checkbox", { name: "Select Jailbreak" }));
+    expect(screen.getByRole("checkbox", { name: "Select alpha" })).not.toBeChecked();
+  });
+
+  it("collapses and expands a game", async () => {
+    renderGrouped([current(1, 606849621, "job-a"), current(3, 606849621, "job-a")]);
+    const jailbreak = await screen.findByTestId("session-game-606849621");
+    const toggle = await within(jailbreak).findByRole("button", { name: /Jailbreak/ });
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    await userEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByTestId("session-running-1")).not.toBeInTheDocument();
+    await userEvent.click(toggle);
+    expect(screen.getByTestId("session-running-1")).toBeInTheDocument();
+  });
+
+  it("puts accounts that need attention on top, apart from their game", async () => {
+    renderGrouped([current(1, 606849621, "job-a"), current(3, 606849621, "job-a"), current(4, 606849621, "job-a")], {
+      clientHealth: new Map<number, ClientHealth>([
+        [2, { pid: 2, logFound: true, drop: { kind: "kicked", reason: null, code: 267, message: "Server restarting", sinceMs: 0 } }],
+        [3, { pid: 3, logFound: true, drop: null, notResponding: true }],
+      ]),
+    });
+    const attention = await screen.findByTestId("session-attention");
+    expect(within(attention).getByText("Needs attention")).toBeInTheDocument();
+    expect(rowIds(attention)).toEqual([2, 3]);
+    const jailbreak = await screen.findByTestId("session-game-606849621");
+    expect(rowIds(jailbreak)).toEqual([1, 4]);
+    expect(attention.compareDocumentPosition(jailbreak) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // Fora do grupo do jogo, a linha diz em que jogo a conta estava.
+    expect(await within(screen.getByTestId("session-running-3")).findByText("Jailbreak")).toBeInTheDocument();
+  });
+
+  it("lists the accounts without a game in their own group", async () => {
+    renderGrouped([current(1, 606849621, "job-a")], {
+      clientHealth: new Map<number, ClientHealth>([[2, { pid: 2, logFound: true, drop: null, inGame: false }]]),
+    });
+    const noGame = await screen.findByTestId("session-no-game");
+    expect(within(noGame).getByText("Not in a game")).toBeInTheDocument();
+    expect(rowIds(noGame)).toEqual([2, 3, 4]);
+  });
+
+  it("stays a plain list when no game is known (outside Windows the log is not read)", async () => {
+    renderGrouped([], { platformCapabilities: makePlatformCapabilities({ os: "macos" }) });
+    expect(screen.getByTestId("session-running-1")).toBeInTheDocument();
+    expect(screen.queryByTestId("session-no-game")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("session-attention")).not.toBeInTheDocument();
+  });
+});
+
+/**
+ * Acessibilidade e texto (crítica da página Session, 11/10/2026): títulos em
+ * ordem, mudança de estado anunciada, área de clique de 24 px, decimal com
+ * vírgula em pt/es, estado vazio com ação.
+ */
+describe("SessionPanel — acessibilidade e texto", () => {
+  it("section titles are h2, under the page's h1", () => {
+    renderPanel({ launchQueue: queue([entry(1, "queued")]), launchedByProgram: new Set([2]) });
+    expect(screen.getByRole("heading", { level: 2, name: "Joining" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { level: 2, name: "In game" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { level: 3, name: "Joining" })).not.toBeInTheDocument();
+  });
+
+  it("announces a drop politely to screen readers", () => {
+    const { rerender } = renderPanel({ launchedByProgram: new Set([1, 2]) });
+    const live = screen.getByTestId("session-live");
+    expect(live).toHaveAttribute("aria-live", "polite");
+    expect(live).toHaveTextContent("");
+    setStore({
+      accounts: ACCOUNTS,
+      ...storeActions(),
+      launchedByProgram: new Set([1, 2]),
+      clientHealth: new Map([
+        [1, { pid: 1, logFound: true, drop: { kind: "disconnected", reason: "connectionLost", code: 277, message: null, sinceMs: 1 } }],
+      ]),
+    });
+    rerender(<SessionPanel />);
+    expect(live).toHaveTextContent("alpha: Disconnected: lost connection");
+  });
+
+  it("the reconnect countdown is a timer", () => {
+    renderPanel({
+      autoReconnect: [
+        {
+          userId: 1,
+          phase: "waiting",
+          attempt: 1,
+          maxAttempts: 5,
+          nextAttemptAtMs: Date.now() + 30_000,
+          reason: null,
+          error: null,
+          drop: { kind: "crashed", reason: null, code: null, message: null, sinceMs: 0 },
+        },
+      ],
+    });
+    expect(within(screen.getByTestId("session-reconnect-1")).getByRole("timer")).toHaveTextContent(/Reconnecting in/);
+  });
+
+  it("small icon buttons get a 24 px target", () => {
+    renderPanel({ launchQueue: queue([entry(1, "queued")]), launchedByProgram: new Set<number>() });
+    const cancel = within(screen.getByTestId("session-queue-1")).getByRole("button", { name: "Cancel alpha" });
+    expect(cancel.className).toMatch(/\bw-6\b/);
+    expect(cancel.className).toMatch(/\bh-6\b/);
+  });
+
+  it("writes memory with a decimal comma in Portuguese", async () => {
+    await i18n.changeLanguage("pt");
+    try {
+      renderWithStore(<SessionPanel />, {
+        accounts: [makeAccount({ UserID: 1, Username: "alpha" })],
+        launchedByProgram: new Set([1]),
+        platformCapabilities: makePlatformCapabilities({ supportsMemoryTrim: true }),
+        settings: { Optimization: { MemoryLimit: "1536" } },
+        clientMemory: new Map([[1, { memoryMb: 1250, limitMb: 1536, over: false, trimmedAtMs: null }]]),
+        ...storeActions(),
+      });
+      // A leitura em MB, com ponto de milhar (como o Gerenciador de Tarefas em pt).
+      expect(within(screen.getByTestId("memory-chip")).getByTestId("memory-reading")).toHaveTextContent("1.250 MB");
+      expect(screen.getByTestId("memory-chip")).toHaveTextContent("1,5 GB");
+    } finally {
+      await i18n.changeLanguage("en");
+    }
+  });
+
+  it("the empty In game list offers to choose a game", async () => {
+    const { store } = renderPanel({
+      launchQueue: null,
+      launchedByProgram: new Set<number>(),
+      selectedIds: new Set([1]),
+    });
+    await userEvent.click(screen.getByRole("button", { name: "Choose a game" }));
+    expect(store.setActivePage).toHaveBeenCalledWith("accounts");
+    expect(store.setChooseGameOpen).toHaveBeenCalledWith(true);
+  });
+
+  it("without accounts selected, the empty state leads to the account list", async () => {
+    const { store } = renderPanel({ launchQueue: null, launchedByProgram: new Set<number>(), selectedIds: new Set() });
+    await userEvent.click(screen.getByRole("button", { name: "Choose a game" }));
+    expect(store.setActivePage).toHaveBeenCalledWith("accounts");
+    expect(store.setChooseGameOpen).not.toHaveBeenCalled();
+  });
+
+  it("says next to Close all that closing MultiAlt leaves the clients running", () => {
+    renderPanel({ launchedByProgram: new Set([1]) });
+    const inGame = document.querySelector("[data-tour='session-in-game']") as HTMLElement;
+    expect(within(inGame).getByText("Closing MultiAlt leaves every Roblox client running.")).toBeInTheDocument();
+  });
+});
+
+/**
+ * Uma conta, um lugar: com o cliente ainda aberto, a tentativa de reconexão
+ * aparece na própria linha do "Em jogo" (em "Needs attention"), e a seção
+ * "Reconnecting" fica só com quem não tem cliente aberto. As duas listas
+ * repetiam as mesmas contas e empurravam o "Em jogo" para baixo (harness
+ * `client-drops`, 820x560).
+ */
+describe("SessionPanel — reconexão na linha da conta", () => {
+  const NOW = Date.now();
+  function reconnect(userId: number, partial: Partial<AutoReconnectEntry> = {}): AutoReconnectEntry {
+    return {
+      userId,
+      phase: "waiting",
+      attempt: 2,
+      maxAttempts: 5,
+      nextAttemptAtMs: NOW + 30_000,
+      reason: null,
+      error: null,
+      drop: { kind: "disconnected", reason: "connectionLost", code: 277, message: null, sinceMs: NOW },
+      ...partial,
+    };
+  }
+
+  it("shows the attempt in the row of an account whose client is open, and only the others apart", async () => {
+    setInvokeMap({ get_nexus_accounts: [], retry_auto_reconnect: true });
+    renderPanel({
+      launchedByProgram: new Set([1, 2]),
+      autoReconnect: [reconnect(1), reconnect(3, { phase: "gaveUp", attempt: 5 })],
+      retryAutoReconnect: vi.fn(async (userId: number) => (await invokeMock("retry_auto_reconnect", { userId })) as boolean),
+    });
+    const row = screen.getByTestId("session-running-1");
+    const line = within(row).getByTestId("session-reconnect-1");
+    expect(within(line).getByRole("timer")).toHaveTextContent(/Reconnecting in/);
+    await userEvent.click(within(line).getByRole("button", { name: /Try now/ }));
+    expect(callsFor("retry_auto_reconnect")).toEqual([["retry_auto_reconnect", { userId: 1 }]]);
+
+    const apart = screen.getByTestId("auto-reconnect-panel");
+    expect(within(apart).queryByTestId("session-reconnect-1")).not.toBeInTheDocument();
+    expect(within(apart).getByTestId("session-reconnect-3")).toBeInTheDocument();
+  });
+
+  it("has no Reconnecting section when every account being reconnected is in the list", () => {
+    setInvokeMap({ get_nexus_accounts: [] });
+    renderPanel({ launchedByProgram: new Set([1]), autoReconnect: [reconnect(1)] });
+    expect(screen.queryByTestId("auto-reconnect-panel")).not.toBeInTheDocument();
+    expect(screen.getByTestId("session-reconnect-1")).toBeInTheDocument();
+  });
+});
+
+describe("SessionPanel — accounts whose client closed", () => {
+  function closedClient(userId: number, overrides: Partial<ClosedClient> = {}): ClosedClient {
+    return {
+      userId,
+      closedAtMs: Date.now() - 120_000,
+      drop: { kind: "crashed", reason: null, code: null, message: null, sinceMs: 1 },
+      placeId: 606849621,
+      rejoin: { placeId: 606849621, jobId: "job-x", launchData: "", joinVip: false, linkCode: "" },
+      ...overrides,
+    };
+  }
+
+  it("lists them with the reason, and Rejoin goes back to the same server through the normal launch", async () => {
+    const { store } = renderPanel({ closedClients: new Map([[2, closedClient(2)]]) });
+    const line = screen.getByTestId("session-closed-2");
+    expect(within(line).getByText("Bravo Alt")).toBeInTheDocument();
+    expect(within(line).getByText("Closed without leaving the game")).toBeInTheDocument();
+
+    await userEvent.click(within(line).getByRole("button", { name: "Rejoin" }));
+    expect(store.joinServer).toHaveBeenCalledWith(2, { placeId: "606849621", jobId: "job-x", launchData: "" });
+  });
+
+  it("the × dismisses it", async () => {
+    const { store } = renderPanel({ closedClients: new Map([[2, closedClient(2)]]) });
+    await userEvent.click(within(screen.getByTestId("session-closed-2")).getByRole("button", { name: "Dismiss Bravo Alt" }));
+    expect(store.dismissClosedClient).toHaveBeenCalledWith(2);
+  });
+
+  it("an account the reconnection still shows is not listed twice; hiding that line hides both", async () => {
+    setInvokeMap({ stop_auto_reconnect: true });
+    const gaveUp: AutoReconnectEntry = {
+      userId: 2,
+      phase: "gaveUp",
+      attempt: 5,
+      maxAttempts: 5,
+      nextAttemptAtMs: null,
+      reason: null,
+      error: null,
+      drop: { kind: "crashed", reason: null, code: null, message: null, sinceMs: 1 },
+    };
+    const { store } = renderPanel({
+      closedClients: new Map([[2, closedClient(2)]]),
+      autoReconnect: [gaveUp],
+      stopAutoReconnect: vi.fn(async () => true),
+    });
+    expect(screen.getByTestId("session-reconnect-2")).toBeInTheDocument();
+    expect(screen.queryByTestId("session-closed-2")).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Dismiss Bravo Alt" }));
+    expect(store.dismissClosedClient).toHaveBeenCalledWith(2);
+  });
+});
+

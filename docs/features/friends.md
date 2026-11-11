@@ -1,0 +1,87 @@
+# Amigos online (aba Friends)
+
+## Objetivo
+
+Mostrar os amigos **online** de cada conta selecionada e, com um clique num amigo, mandar **todas** as contas selecionadas para o servidor dele — sem o usuário ter que descobrir Job ID, copiar link ou usar o Follow por nome.
+
+## Onde fica o código
+
+| Peça | Arquivo |
+|---|---|
+| Cliente da API | [api/roblox/friends.rs](../../src-tauri/src/api/roblox/friends.rs) (`get_online_friends`) |
+| Comandos Tauri | [commands/account_api.rs](../../src-tauri/src/commands/account_api.rs) (`get_online_friends`, `get_online_friends_for_accounts`, `collect_online_friends`) |
+| UI | [components/friends/FriendsTab.tsx](../../src/components/friends/FriendsTab.tsx) |
+| Tipos no frontend | [types.ts](../../src/types.ts) (`OnlineFriend`, `AccountFriends`, `FriendsOnlineProgress`) |
+| Evento | `friends-online-progress` → `{ done, total, requestId, entry }` |
+| Suíte de teste | `bun run t friends` |
+
+## Fluxo
+
+1. O usuário abre a aba **Friends** da tela Choose Game com N contas selecionadas.
+2. O frontend chama `get_online_friends_for_accounts({ userIds, delayMs, requestId })`.
+3. O backend percorre as contas **em sequência**, com pausa entre elas, e faz **uma** requisição por conta: `GET friends.roblox.com/v1/users/{userId}/friends/online` com o cookie daquela conta.
+4. Como o payload dessa rota não traz mais `name`/`displayName` (mudança da Roblox em out/2024), os nomes são completados em lote por `POST users.roblox.com/v1/users` (100 ids por requisição). Quando um amigo está em jogo mas sem `gameInstanceId`, há um resgate opcional via `presence.roblox.com/v1/presence/users` **com cookie** (sem cookie a Roblox omite o `gameId`).
+5. Cada conta vira um `AccountFriends { userId, friends, error }` — o erro de uma conta **não** derruba as outras. Assim que uma conta volta, o evento `friends-online-progress` leva a contagem **e a entrada dela** (`entry`), com o `requestId` que a tela mandou; a aba desenha aquela conta na hora, sem esperar o lote. O comando ainda devolve o lote inteiro no fim, e é essa a versão final da lista.
+6. Ao clicar num amigo entrável, a aba chama `launchAll(userIds, placeId, jobId)` (o `useLauncher` da Choose Game, que usa `launch_multiple`).
+
+### Carga progressiva e cache da aba
+
+- **Fileiras de amigos** (pedido do dono, 14/10/2026), como o "Friends" do site do Roblox: cada conta é uma fileira ([CardRail.tsx](../../src/components/ui/CardRail.tsx)) com a foto grande do amigo (miniatura 150x150), o nome, o jogo e "Join". A lista em linha cheia deixava a tela larga vazia. Amigo que não dá para seguir continua aparecendo, esmaecido, com o motivo no lugar do jogo.
+
+- **Uma conta por vez na tela.** Enquanto a rodada corre, a aba mostra todas as contas da seleção, **na ordem da seleção** (a mesma do retorno final), não na ordem em que as respostas chegam (`upsertAccountFriends`). Conta que ainda não voltou aparece como pendente (`friends-pending-<id>`: cabeçalho com spinner e *Loading friends...*). Evento com outro `requestId` (sobra de uma rodada anterior) é ignorado; evento sem `requestId` só atualiza a contagem.
+- **Voltar à aba mostra o que ela tinha.** A última lista de cada seleção fica num cache de memória da sessão (`friendsCache`, ver `utils/sessionCache.ts`), assim como as miniaturas dos amigos. Ao voltar (trocando de aba ou saindo e entrando na Choose Game), a lista aparece no primeiro desenho e a consulta roda por trás: cada conta mostra um spinner no cabeçalho (`friends-updating-<id>`) até a resposta nova dela chegar e tomar o lugar.
+- **Voltar no meio de uma rodada não abre outra.** A rodada em curso fica registrada por seleção (`runningLoads`); a aba que monta de novo se junta a ela em vez de chamar o backend outra vez — duas rodadas juntas dobrariam as chamadas à API de amigos.
+- As miniaturas continuam saindo **num lote só**, no fim da rodada (como antes) — pedir por conta multiplicaria as chamadas.
+
+## Regras de negócio
+
+- **Uma requisição por conta.** O rate limit da API de amigos é agressivo; consultar amigo a amigo derruba a conta em segundos. A pausa entre contas existe pelo mesmo motivo.
+- **Todos os online aparecem**, não só os entráveis. Quem não dá para seguir fica esmaecido **com o motivo** — senão o amigo "some" da lista e o usuário não entende por quê:
+
+  | Situação | Motivo mostrado |
+  |---|---|
+  | `presenceType == 1` (online, fora de jogo) | *On the website* |
+  | `presenceType == 3` | *In Studio* |
+  | Em jogo, sem `gameId` | *Server not visible* (privacidade do amigo) |
+
+- **`placeId` tem prioridade sobre `rootPlaceId`**: o Job ID (`gameId`) é de um servidor **do place em que o amigo está**, que pode ser um sub-place. Com o raiz, o launch pedia "o servidor X no place raiz" — que não existe ali — e o cliente abria em *This experience has ended, or the server became unavailable*. Visto no Life Sentence, que tem 6 places (o raiz distribui para "VC Only", "Pro Players"...). O raiz fica de reserva, para quando o `placeId` não vem. Até 28/09/2026 era o contrário. O Follow da Choose Game segue a mesma regra com Job ID; **sem** Job ID (servidor escondido, entrada num servidor público do jogo) ele usa o raiz, porque sub-place de teleporte pode não aceitar entrada direta.
+- **O launch passa sempre por `launch_multiple`** (`launchAll`). Um laço próprio com `launch_roblox` fura o piso anti-captcha de 8 s que o backend aplica entre contas — foi exatamente o bug corrigido no Follow (ver [multi-launch.md](multi-launch.md)).
+- **Nomes de amigos nunca são mascarados.** São terceiros e o usuário precisa reconhecê-los; `hideUsernames` vale só para os nomes das contas do próprio usuário.
+- O servidor do amigo é resolvido **uma vez** e todas as contas vão para aquele `jobId` — não há uma resolução por conta.
+
+### Entrar seguindo o amigo
+
+Desde 14/10/2026 o "Join" da aba **Amigos** e o "Follow" da aba **Seguir** entram **seguindo** o jogador (`RequestFollowUser&userId=<amigo>` no PlaceLauncher, `follow_user_id` em `launch_multiple`), como o Roblox Account Manager antigo fazia. Antes o MultiAlt lia o servidor do amigo pela presença e pedia **o servidor exato** (`RequestGameJob` + Job ID).
+
+- **Por quê:** um usuário relatou (ticket, 14/10/2026) CAPTCHA em toda entrada das alts no MultiAlt, inclusive "entrando pelo amigo", enquanto no RAM antigo entrar pelo amigo funcionava sem nada. A comparação dos dois launches (link, browserTrackerId, ticket, locale, canal) só achou essa diferença de peso: o antigo segue o usuário e o Roblox escolhe o servidor; o MultiAlt pedia o servidor exato. Que o pedido do servidor exato atraia mais CAPTCHA é **dedução** a partir do relato, não algo que o código prove.
+- **Toggle:** `General.JoinFriendsByFollowing` (padrão **ligado**), caixa "Join by following the player (helps avoid CAPTCHA)" nas duas abas ([JoinByFollowingToggle.tsx](../../src/components/friends/JoinByFollowingToggle.tsx)). Desligado, volta ao pedido do servidor exato.
+- **O jogo continua sendo o do amigo:** `place_id` do pedido é o place dele (fila, reconexão e Rejoin usam o jogo de verdade); só o link de entrada usa o usuário (`follow_target` em [launch.rs](../../src-tauri/src/commands/launch.rs)). Seguindo, a preferência de servidor e o sorteio não entram (quem escolhe é o Roblox).
+- **Sempre pelo lote** (`launch_multiple`), mesmo com uma conta: o "seguir" só existe nele.
+- **Aba Seguir:** seguindo, o servidor escondido não impede (o Roblox acha o jogador); só presença **offline** para sem abrir nada. No modo antigo, servidor escondido pergunta antes de cair num público.
+- A privacidade do jogador ("quem pode entrar em mim") vale: se ela não deixar, o Roblox recusa a entrada, como no RAM antigo.
+
+### Esperar o jogador entrar num jogo (aba Seguir, desde 15/10/2026)
+
+Quando o Follow não consegue entrar (jogador offline; com o toggle desligado, também fora de jogo ou com o servidor escondido e o "entrar num público" recusado), além do aviso de sempre aparece **"Wait until they're in a game"**. Clicado, a tela passa a mostrar *Watching <nome>… (checks every 30 s)* com **Cancel**, e lança as contas selecionadas **assim que** o jogador estiver entrável.
+
+- **Quando conta como entrável** ([utils/waitForPlayer.ts](../../src/utils/waitForPlayer.ts), `evaluateWaitPresence`): seguindo, basta `userPresenceType == 2` (em jogo) — online no site ou no Studio não serve, seguir daria em nada; sem seguir, em jogo **e** com Job ID e place visíveis (place do servidor, como no Follow). O toggle é lido na hora de cada consulta.
+- **Ritmo** (constantes no mesmo arquivo): uma consulta a cada `WAIT_POLL_INTERVAL_MS` (30 s), a primeira só depois do primeiro intervalo; erro dobra a espera (60 s, 120 s…) até `WAIT_ERROR_BACKOFF_MAX_MS` (5 min); 429 sem `Retry-After` vai direto aos 5 min; com `Retry-After` espera o que o Roblox pediu se for mais. Desiste sozinha em `WAIT_MAX_DURATION_MS` (2 h), com aviso.
+- **`Retry-After`:** o `get_presence_as` põe a espera no erro do 429 (`Failed to get presence (status 429, retry after 90 s)`), e a política lê o número (`parseRetryAfterMs`).
+- **Presença:** o mesmo comando `get_presence` do Follow — sem `run_with_session_retry`, sem refresh de sessão.
+- **Onde vive:** num módulo ([components/follow/waitForPlayerWatch.ts](../../src/components/follow/waitForPlayerWatch.ts)), não no estado da aba — trocar de aba dentro da Choose Game não para a espera. A Choose Game a sustenta (`useWaitForPlayerHost`: fornece o launch) e, ao sumir (fechada ou a pessoa trocou de página com ela aberta), a cancela — mas **avisa** ("Stopped waiting for \<nome\>: the accounts screen closed."), não some em silêncio; quem clicou em **Cancel** já parou a espera, então aí não avisa de novo.
+- **Lança a seleção do momento:** o launch usa as contas selecionadas **quando o jogador entra**, não as de quando a espera começou (`currentUserIds` no host). Tirar um chip do lote enquanto espera não lança a conta removida; lote vazio encerra a espera sem lançar.
+- **Um launch só, e para:** quando o jogador fica entrável, a espera lança pelo `launchAll` de sempre (`launch_multiple`, seguindo ou no servidor exato, com o aviso de conta online) e termina, dê certo ou não.
+- Testes: `waitForPlayer.test.ts` (política), `waitForPlayerWatch.test.ts` (laço com timers falsos) e os de `ChooseGameScreen.test.tsx` (começar, cancelar, trocar de aba, lançar uma vez); `social_presence_extra_tests` (Rust, `Retry-After`).
+
+## Configurações relacionadas
+
+- `hideUsernames` / letras de prévia — mascaramento dos nomes **das contas** (não dos amigos).
+- O atraso entre contas (`delayMs`) tem padrão no backend (`FRIENDS_ONLINE_DELAY_MS`); a UI manda o seu próprio valor.
+
+## Armadilhas / cuidados
+
+- A rota antiga `friends/v1/my/friends/online` foi **removida** pelo Roblox e responde 404 para todo mundo — foi o que fez a aba mostrar "status 404" em todas as contas. A rota atual leva o `userId` na URL **e** o cookie da conta.
+- Nessa rota a presença vem aninhada em `userPresence`, com as chaves em maiúscula e o tipo como **texto** (`"InGame"`), não número. O parser aceita as duas formas, e um nome novo vira presença desconhecida em vez de derrubar o amigo.
+- A presença **sem** cookie (`api::roblox::get_presence`) não devolve `gameId`; por isso o resgate de presença usa `get_presence_as(cookie, ids)`. O **comando** `get_presence` também manda cookie: o da conta pedida em `viewerUserId` ou, sem ela, o da primeira conta válida (`pick_viewer_cookie`); se a chamada autenticada falhar, repete sem cookie, para uma sessão morta não apagar a presença de todo mundo. Nunca passa por `run_with_session_retry`. **Ressalva:** o `gameId` que volta para as outras contas depende da privacidade/amizade de quem foi escolhida como viewer — é assim que a API funciona. O Follow da Choose Game depende disso para achar o servidor do alvo.
+- Amigo em jogo com servidor escondido não vira erro — vira linha esmaecida. Transformar isso em erro esconderia o resto da lista.
+- Não usar `run_with_session_retry` nessas leituras: o refresh desloga a conta em todo lugar (ver [authentication.md](authentication.md)).

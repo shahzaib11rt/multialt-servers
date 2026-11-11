@@ -1,0 +1,107 @@
+import { describe, expect, it } from "vitest";
+import { clientHealthLabel, wrongAccountLabel, wrongAccountToast } from "./clientHealth";
+import type { ClientDrop } from "../types";
+import ptCommon from "../locales/pt/common.json";
+
+/**
+ * Em português o sujeito é a conta (feminino): "Caiu: ficou parada", "ser
+ * expulsa". "Foi expulso" destoava das vizinhas.
+ */
+describe("drop labels in Portuguese", () => {
+  const pt = ptCommon as Record<string, string>;
+  const ptT = (text: string, options?: Record<string, unknown>) =>
+    (pt[text] ?? text).replace(/\{\{(\w+)\}\}/g, (_, key: string) => String(options?.[key] ?? ""));
+  const drops: Partial<ClientDrop>[] = [
+    { kind: "disconnected", reason: "connectionLost" },
+    { kind: "disconnected", reason: "joinedElsewhere" },
+    { kind: "disconnected", reason: "idle" },
+    { kind: "disconnected" },
+    { kind: "kicked", message: "x" },
+    { kind: "kicked" },
+    { kind: "serverShutdown" },
+    { kind: "crashed" },
+  ];
+
+  it("talk about the account in the feminine", () => {
+    for (const partial of drops) {
+      const label = clientHealthLabel(drop(partial), ptT)?.label ?? "";
+      expect(label, JSON.stringify(partial)).not.toMatch(/\b(expulso|parado|fechado|desconectado)\b/i);
+    }
+  });
+});
+
+const t = (text: string, options?: Record<string, unknown>) =>
+  text.replace(/\{\{(\w+)\}\}/g, (_, key: string) => String(options?.[key] ?? ""));
+
+function drop(partial: Partial<ClientDrop>): { pid: number; logFound: boolean; drop: ClientDrop } {
+  return {
+    pid: 1,
+    logFound: true,
+    drop: { kind: "disconnected", reason: null, code: null, message: null, sinceMs: 0, ...partial },
+  };
+}
+
+describe("clientHealthLabel", () => {
+  /** Bateria de 25/10/2026: a tela "confirme que é humano" parava a conta sem aviso. */
+  it("names the Roblox human check, and a drop still wins over it", () => {
+    expect(clientHealthLabel({ pid: 1, logFound: true, drop: null, challenge: true }, t)).toEqual({
+      label: "Roblox human check",
+      detail: "Roblox is asking to confirm you're human. Solve it in the game window.",
+      tone: "challenge",
+    });
+    expect(clientHealthLabel({ ...drop({ reason: "connectionLost" }), challenge: true }, t)?.tone).toBe("drop");
+  });
+
+  it("is empty when nothing dropped", () => {
+    expect(clientHealthLabel(null, t)).toBeNull();
+    expect(clientHealthLabel({ pid: 1, logFound: true, drop: null }, t)).toBeNull();
+  });
+
+  it("names each reason in a short sentence", () => {
+    expect(clientHealthLabel(drop({ reason: "connectionLost" }), t)?.label).toBe("Disconnected: lost connection");
+    expect(clientHealthLabel(drop({ reason: "joinedElsewhere" }), t)?.label).toBe(
+      "Disconnected: the account joined somewhere else"
+    );
+    expect(clientHealthLabel(drop({ reason: "idle" }), t)?.label).toBe("Disconnected: idle for too long");
+    expect(clientHealthLabel(drop({ reason: "other", code: 280 }), t)).toEqual({
+      label: "Disconnected from the game",
+      detail: "Roblox error code 280",
+      tone: "drop",
+    });
+    expect(clientHealthLabel(drop({ kind: "kicked" }), t)?.label).toBe("Kicked from the game");
+    expect(clientHealthLabel(drop({ kind: "kicked", message: "bye" }), t)?.label).toBe("Kicked: bye");
+    expect(clientHealthLabel(drop({ kind: "serverShutdown" }), t)?.label).toBe("The server shut down");
+    expect(clientHealthLabel(drop({ kind: "crashed" }), t)?.label).toBe("Closed without leaving the game");
+  });
+
+  it("says when the window stopped responding, but a drop wins", () => {
+    const hung = { pid: 1, logFound: true, drop: null, notResponding: true };
+    expect(clientHealthLabel(hung, t)).toMatchObject({ label: "Not responding", tone: "hung" });
+    expect(clientHealthLabel({ ...drop({ kind: "serverShutdown" }), notResponding: true }, t)).toMatchObject({
+      label: "The server shut down",
+      tone: "drop",
+    });
+  });
+});
+
+describe("wrong account", () => {
+  it("names the account the client opened as", () => {
+    expect(wrongAccountLabel({ pid: 1, logFound: true, drop: null, wrongAccountUserId: 4242 }, t)).toBe(
+      "Opened as a different Roblox account (user 4242)"
+    );
+    expect(wrongAccountLabel({ pid: 1, logFound: true, drop: null, wrongAccountUserId: null }, t)).toBeNull();
+    expect(wrongAccountLabel({ pid: 1, logFound: true, drop: null }, t)).toBeNull();
+    expect(wrongAccountLabel(undefined, t)).toBeNull();
+  });
+
+  it("is not a drop: the drop label stays as it was", () => {
+    expect(clientHealthLabel({ pid: 1, logFound: true, drop: null, wrongAccountUserId: 4242 }, t)).toBeNull();
+  });
+
+  it("mentions the launch queue only when it was paused", () => {
+    expect(wrongAccountToast("Alt 3", 4242, true, t)).toBe(
+      "Alt 3 opened as a different Roblox account (user 4242). The launch queue was paused."
+    );
+    expect(wrongAccountToast("Alt 3", 4242, false, t)).toBe("Alt 3 opened as a different Roblox account (user 4242).");
+  });
+});
