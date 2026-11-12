@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, useEffect } from "react";
+import { useState, useCallback, useRef, useEffect, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { ServerData, ServersResponse, PlaceDetails, ServerRegion } from "./types";
 import { looksLikeJoinLink, parsePlaceIdInput } from "./types";
@@ -19,6 +19,10 @@ export interface ServersTabProps {
   prefillNonce?: number;
   /** Nome de uma conta do usuário (com a máscara), ou `null` — para a seção de servidores privados. */
   accountName?: (userId: number) => string | null;
+  /** Faixa "você está aqui" acima da lista (servidor atual da conta). */
+  currentServer?: ReactNode;
+  /** Job ID do servidor atual: a linha dele fica destacada. */
+  currentJobId?: string | null;
 }
 
 export function ServersTab({
@@ -31,6 +35,8 @@ export function ServersTab({
   prefillJobId,
   prefillNonce,
   accountName,
+  currentServer,
+  currentJobId,
 }: ServersTabProps) {
   const t = useTr();
   const [manualJobId, setManualJobId] = useState("");
@@ -334,6 +340,8 @@ export function ServersTab({
         />
       )}
 
+      {currentServer}
+
       <div className="flex-1 min-h-0 overflow-y-auto rounded-lg border border-zinc-800/60 bg-zinc-950/50">
         <table className="w-full text-left">
           <thead className="sticky top-0 bg-zinc-900/95 backdrop-blur-sm z-10">
@@ -364,7 +372,7 @@ export function ServersTab({
               return (
                 <tr
                   key={server.id}
-                  className="border-b border-zinc-800/30 hover:bg-zinc-800/30 transition-colors cursor-pointer group"
+                  className={`border-b border-zinc-800/30 hover:bg-zinc-800/30 transition-colors cursor-pointer group ${currentJobId && server.id === currentJobId ? "bg-emerald-500/10" : ""}`}
                   onDoubleClick={() => onJoinServer(server.accessCode ? `VIP:${server.accessCode}` : server.id)}
                   onContextMenu={(e) => {
                     e.preventDefault();

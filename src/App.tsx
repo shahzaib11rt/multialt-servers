@@ -49,6 +49,7 @@ import { AfkPage } from "./components/pages/AfkPage";
 import { DiscordPage } from "./components/pages/DiscordPage";
 import { LivePage } from "./components/pages/LivePage";
 import { ServersPage } from "./components/pages/ServersPage";
+import { ServerRegionRecorder } from "./components/servers/ServerRegionRecorder";
 import { AvatarsPage } from "./components/pages/AvatarsPage";
 import { GroupsPage } from "./components/pages/GroupsPage";
 import { ScriptsPage } from "./components/pages/ScriptsPage";
@@ -286,6 +287,7 @@ function AppContent() {
           <DiscordPage active={page === "discord"} onLeave={leavePage} />
           <LivePage active={page === "live"} onLeave={leavePage} />
           <ServersPage active={page === "servers"} onLeave={leavePage} />
+          <ServerRegionRecorder />
           <AvatarsPage active={page === "avatars"} onLeave={leavePage} />
           <GroupsPage active={page === "groups"} onLeave={leavePage} />
           <ScriptsPage active={page === "scripts"} onLeave={leavePage} />

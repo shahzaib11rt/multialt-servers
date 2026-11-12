@@ -11,7 +11,7 @@
 /// [`resolve_manifest_channel`] (`stable`, `beta`, `stable-nexus-ws`,
 /// `beta-nexus-ws`). Quem publica e o workflow `.github/workflows/release.yml`.
 const UPDATER_MANIFEST_BASE: &str =
-    "https://raw.githubusercontent.com/luanmacea/MultiAlt/update-manifests";
+    "https://raw.githubusercontent.com/shahzaib11rt/multialt-servers/update-manifests";
 
 type PendingUpdate = (tauri_plugin_updater::Update, String, String);
 
@@ -593,7 +593,7 @@ mod updater_tests {
             "o updater voltou a apontar para o projeto original: {alvo}"
         );
         assert!(
-            alvo.contains("/luanmacea/"),
+            alvo.contains("/shahzaib11rt/"),
             "o manifesto tem que vir deste repositorio: {alvo}"
         );
     }

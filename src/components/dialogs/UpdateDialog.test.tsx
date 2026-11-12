@@ -204,7 +204,7 @@ describe("notas da atualização — como aparecem na janela", () => {
     expect(screen.getByText("Beta version.")).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "#21" })).toHaveAttribute(
       "href",
-      "https://github.com/luanmacea/MultiAlt/pull/21"
+      "https://github.com/shahzaib11rt/multialt-servers/pull/21"
     );
     expect(screen.queryByText(/Download MultiAlt-Setup/)).not.toBeInTheDocument();
   });

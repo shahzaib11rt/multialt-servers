@@ -14,6 +14,7 @@ import { ServersTab } from "./ServersTab";
 import { GamesTab } from "./GamesTab";
 import { FavoritesTab } from "./FavoritesTab";
 import { RecentTab } from "./RecentTab";
+import { CurrentServerBanner, useCurrentServer } from "./CurrentServerBanner";
 import { TabBar } from "./TabBar";
 import { X } from "lucide-react";
 
@@ -38,6 +39,7 @@ export function ServerListDialog({ open, onClose }: ServerListDialogProps) {
   const maxRecent = parseInt(store.settings?.General?.MaxRecentGames || "8") || 8;
   const maxRecentJobs = parseInt(store.settings?.General?.MaxRecentJobs || "12") || 12;
   const userId = store.selectedAccount?.UserID || null;
+  const currentServer = useCurrentServer(userId, open);
 
   useEffect(() => {
     if (open) {
@@ -205,6 +207,8 @@ export function ServerListDialog({ open, onClose }: ServerListDialogProps) {
               refreshOnOpenSignal={refreshOnOpenSignal}
               prefillJobId={jobIdPrefill}
               prefillNonce={jobIdPrefillNonce}
+              currentJobId={currentServer?.session.jobId ?? null}
+              currentServer={<CurrentServerBanner current={currentServer} />}
               accountName={(id) => {
                 const account = store.accounts.find((a) => a.UserID === id);
                 return account ? accountLabel(account, store, id) : null;

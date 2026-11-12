@@ -1,5 +1,6 @@
 import { RecentGamesList } from "./RecentGamesList";
-import { RecentJobsList } from "./RecentJobsList";
+import { GameJobHistory } from "./GameJobHistory";
+import { useState } from "react";
 import { useTr } from "../../i18n/text";
 import type { GameEntry } from "./types";
 
@@ -22,6 +23,7 @@ export interface RecentTabProps {
    * e item que não faz nada é pior que item ausente.
    */
   onSelectJob?: (placeId: number | null, raw: string) => void;
+  /** Mantido por compatibilidade: a coluna agora mostra o histórico do jogo. */
   maxRecentJobs?: number;
   /** Ver `RecentGamesList.fill`. */
   fill?: boolean;
@@ -39,16 +41,19 @@ export function RecentTab({
   onBotting,
   onScripts,
   onSelectJob,
-  maxRecentJobs = 12,
   fill = true,
   layout = "list",
 }: RecentTabProps) {
   const t = useTr();
+  // Com a coluna de servidores, clicar num jogo o **seleciona** (a coluna da
+  // direita mostra os Job IDs dele); "Browse servers" segue no menu do jogo.
+  const [selectedPlaceId, setSelectedPlaceId] = useState<number | null>(null);
   const games = (
     <RecentGamesList
       userId={userId}
       maxRecent={maxRecent}
-      onSelect={onSelectGame}
+      onSelect={onSelectJob ? (placeId) => setSelectedPlaceId(placeId) : onSelectGame}
+      selectedPlaceId={onSelectJob ? selectedPlaceId : undefined}
       onJoinGame={onJoinGame}
       onBrowseServers={onBrowseServers}
       onAddFavorite={onAddFavorite}
@@ -70,12 +75,12 @@ export function RecentTab({
         <div className="flex-1 min-h-0">{games}</div>
       </div>
       <div className="w-px bg-zinc-800/60" />
-      <div className="flex flex-col w-[252px] shrink-0 min-h-0">
+      <div className="flex flex-col w-[280px] shrink-0 min-h-0">
         <div className="px-1 pb-1 text-[11px] font-semibold uppercase tracking-wider text-zinc-500">
           {t("Servers")}
         </div>
         <div className="flex-1 min-h-0">
-          <RecentJobsList userId={userId} maxRecent={maxRecentJobs} onSelect={onSelectJob} />
+          <GameJobHistory placeId={selectedPlaceId} onSelectJob={onSelectJob} />
         </div>
       </div>
     </div>

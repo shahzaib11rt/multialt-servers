@@ -30,6 +30,8 @@ export interface RecentGamesListProps {
    * põe os recentes de cada conta embaixo, e a rolagem é da aba inteira).
    */
   fill?: boolean;
+  /** Jogo escolhido (coluna de servidores da aba Recent): fica destacado. */
+  selectedPlaceId?: number | null;
   /**
    * `rail` = fileira lateral de cards com o título "Opened by MultiAlt" (aba
    * Recentes da Escolher jogo, pedido do dono em 14/10/2026); `list` = linhas
@@ -48,6 +50,7 @@ export function RecentGamesList({
   onBotting,
   onScripts,
   fill = true,
+  selectedPlaceId,
   layout = "list",
 }: RecentGamesListProps) {
   const t = useTr();
@@ -276,7 +279,7 @@ export function RecentGamesList({
               key={game.placeId}
               role="button"
               tabIndex={0}
-              className="flex items-center gap-3 p-2 rounded-lg hover:bg-zinc-800/40 transition-colors cursor-pointer outline-none"
+              className={`flex items-center gap-3 p-2 rounded-lg hover:bg-zinc-800/40 transition-colors cursor-pointer outline-none ${selectedPlaceId === game.placeId ? "bg-zinc-800/60 ring-1 ring-sky-500/40" : ""}`}
               onClick={() => onSelect(game.placeId, game.name, game.iconUrl)}
               onContextMenu={(e) => {
                 e.preventDefault();

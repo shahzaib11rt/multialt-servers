@@ -5,6 +5,7 @@ import userEvent from "@testing-library/user-event";
 
 vi.mock("../../store", async () => (await import("../../test-utils/renderWithStore")).storeModuleMock());
 vi.mock("@tauri-apps/api/core", async () => (await import("../../test-utils/tauriMocks")).tauriCoreMock());
+vi.mock("@tauri-apps/api/event", async () => (await import("../../test-utils/tauriMocks")).tauriEventMock());
 vi.mock("../../hooks/usePrompt", async () => (await import("../../test-utils/promptMocks")).promptModuleMock());
 
 import { ServerListDialog } from "./ServerListDialog";
@@ -186,9 +187,12 @@ describe("ServerListDialog — menu do jogo completo, como na Choose Game", () =
     }
   });
 
-  it("a coluna de servidores recentes continua aqui", async () => {
+  it("a coluna da direita mostra o histórico de Job IDs do jogo escolhido", async () => {
+    saveRecentGames([{ placeId: 555, name: "Blox Test", iconUrl: null, lastPlayed: Date.now() }]);
     renderDialog();
     await userEvent.click(screen.getByRole("button", { name: "Recent" }));
-    expect(await screen.findByText("No recent servers")).toBeInTheDocument();
+    expect(await screen.findByText("Click a game to see the servers you played in it.")).toBeInTheDocument();
+    await userEvent.click(await screen.findByText("Blox Test"));
+    expect(await screen.findByText("No servers in the history yet.")).toBeInTheDocument();
   });
 });

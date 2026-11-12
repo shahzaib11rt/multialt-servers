@@ -306,7 +306,7 @@ fn export_nexus_lua() -> Result<String, String> {
 /// continuava levando para la; o mesmo endereco vivia espalhado no frontend e
 /// no updater (que oferecia instalar o binario do outro projeto por cima
 /// deste). O lado TS tem o par disto em `src/repo.ts`.
-const REPO_URL: &str = "https://github.com/luanmacea/MultiAlt";
+const REPO_URL: &str = "https://github.com/shahzaib11rt/multialt-servers";
 
 /// Convite do servidor do app no Discord (o mesmo do README e do site). Fica
 /// aqui, numa constante: a tela só pede para abrir, nunca manda um endereço.
@@ -461,7 +461,7 @@ mod services_command_tests {
 
     #[test]
     fn repo_url_points_at_the_project_over_https() {
-        assert_eq!(REPO_URL, "https://github.com/luanmacea/MultiAlt");
+        assert_eq!(REPO_URL, "https://github.com/shahzaib11rt/multialt-servers");
         assert!(REPO_URL.starts_with("https://github.com/"));
         // No shell metacharacters: the URL is handed to `cmd /C start`.
         assert!(!REPO_URL.contains(|c: char| c.is_whitespace() || c == '&' || c == '"'));
@@ -479,11 +479,11 @@ mod services_command_tests {
     fn feedback_forms_open_this_repos_issue_templates() {
         assert_eq!(
             feedback_form_url("bug").as_deref(),
-            Some("https://github.com/luanmacea/MultiAlt/issues/new?template=bug_report.yml")
+            Some("https://github.com/shahzaib11rt/multialt-servers/issues/new?template=bug_report.yml")
         );
         assert_eq!(
             feedback_form_url("idea").as_deref(),
-            Some("https://github.com/luanmacea/MultiAlt/issues/new?template=feature_request.yml")
+            Some("https://github.com/shahzaib11rt/multialt-servers/issues/new?template=feature_request.yml")
         );
     }
 
